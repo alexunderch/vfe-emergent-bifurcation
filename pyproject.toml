@@ -1,0 +1,10 @@
+[project]
+name = "vfe-emergent-bifurcation"
+version = "0.1.0"
+description = "Emergent communication in signalling games."
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
