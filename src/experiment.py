@@ -26,10 +26,11 @@ class Role(enum.StrEnum):
 	RECEIVER = "receiver"
 
 params = {
-    "font.size": 13,
-    "axes.labelsize": 13,
-    "xtick.labelsize": 13,
-    "ytick.labelsize": 13,
+    "font.size": 18,
+    "axes.labelsize": 18,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+	"lines.linewidth": 2
 }
 mpl.rcParams.update(params)
 
@@ -310,28 +311,10 @@ def two_parameter_sweep(
 	plt.colorbar(label=r'Mutual Information $I(\mathcal{W}; \mathcal{A})$ (bits)')
 	plt.xlabel(r'Sensitifity rate $\beta$')
 	plt.ylabel(r'Damping rate $\gamma$')
-	plt.title('Phase Diagram: Climbing game')
+	plt.title('Phase Diagram: Classic Lewis game')
 
-	# Annotate Regimes
-	# plt.text(0.2, 1.0, 'I. Babbling', color='white', fontweight='bold', ha='center')
-	# plt.text(0.3, 4.0, 'II. Pooling', color='white', fontweight='bold', ha='center')
-	# plt.text(1.5, 4.0, 'III. Signaling', color='white', fontweight='bold', ha='center')
 	plt.show()
 	plt.tight_layout()
-
-	# plt.imshow(results_reward, extent=[params_lhs[0], params_lhs[-1], params_rhs[0], params_rhs[-1]], 
-	# 						origin='lower', aspect='auto', cmap='magma')
-	# plt.colorbar(label=r'Eval payoff $U$')
-	# plt.xlabel(r'Sensitifity rate $\beta$')
-	# plt.ylabel(r'Damping rate $\gamma$')
-	# plt.title('Phase Diagram: Emergence of Communication')
-
-	# # Annotate Regimes
-	# # plt.text(0.2, 1.0, 'I. Babbling', color='white', fontweight='bold', ha='center')
-	# # plt.text(0.3, 4.0, 'II. Pooling', color='white', fontweight='bold', ha='center')
-	# # plt.text(1.5, 4.0, 'III. Signaling', color='white', fontweight='bold', ha='center')
-	# plt.show()
-	# plt.tight_layout()
 
 
 
@@ -392,31 +375,7 @@ def hysteresis(
 	plt.savefig(f'hysteresis_{param_name}_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
 	plt.show()
 
-# def policy_evolution(ts, policy_history, num_states, num_messages):
-# 	"""
-# 	Plots the probability of each message over time for each observation.
-# 	policy_history: shape [time, observation, message]
-# 	"""
-# 	fig, axes = plt.subplots(1, num_states, figsize=(15, 4), sharey=True)
-# 	colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
 
-# 	for obs_idx in range(num_states):
-# 		ax = axes[obs_idx]
-# 		for msg_idx in range(num_messages):
-# 			# Extract the probability of message 'msg_idx' given observation 'obs_idx'
-# 			probs = policy_history[:, obs_idx, msg_idx]
-# 			ax.plot(ts, probs, label=f"Signal {msg_idx}", color=colors[msg_idx % len(colors)], lw=2)
-					
-# 		ax.set_title(f"Observation {obs_idx} Policy")
-# 		ax.set_xlabel("Time")
-# 		if obs_idx == 0:
-# 			ax.set_ylabel("Probability $P(m|o)$")
-# 		ax.grid(True, alpha=0.3)
-
-# 	plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-# 	plt.tight_layout()
-# 	plt.show()
-  
 def evaluate_policies(
 	flags:  SFlags, 
 	sim: Callable, 
@@ -436,7 +395,7 @@ def evaluate_policies(
 
   
 	def init_fig():
-		fig, ax = plt.subplots(1, 1)
+		fig, ax = plt.subplots(1, 1, figsize=(10, 7))
 		ax.spines["top"].set_visible(False)
 		ax.spines["right"].set_visible(False)
 		return fig, ax
@@ -690,9 +649,9 @@ def plot_coordination_snap(
 		eig_r.append(logs["leading_eigenvalue_r"][:, -1])
 
 	
-	fig, ax1 = plt.subplots(figsize=(10, 6))
+	fig, ax1 = plt.subplots(figsize=(10, 7))
 
-	# Axis 1: Leading Eigenvalue
+	# Axis 1: Mutual Information
 	color = 'tab:red'
 	scalar = np.array(joint_mi).transpose()
 	xs = np.arange(scalar.shape[1]) * flags.log_interval
@@ -700,12 +659,12 @@ def plot_coordination_snap(
 	sem1 = stats.sem(scalar, axis=0)
 	ax1.plot(params, mean1, color=color, label="Coordination")
 	ax1.fill_between(params, mean1 - sem1, mean1 + sem1, alpha=0.5,  color=color)
-	ax1.set_ylabel(r"$I(\mathcal{W}; \mathcal{A})$ bits")
+	ax1.set_ylabel(r"joint $I(\mathcal{W}; \mathcal{A})$ bits")
 	ax1.set_ylim(0, 1.6) # Max for 3 states is log2(3) ~ 1.58
 	ax1.tick_params(axis='y', labelcolor=color)
 	ax1.set_xlabel(r"Sensitivity $\beta$")
 
-	# Axis 2: Mutual Information
+	# Axis 2: Leading eigenvalues
 	ax2 = ax1.twinx()
 	color = 'tab:blue'
 	scalar = np.array(eig_s).transpose()
@@ -714,6 +673,7 @@ def plot_coordination_snap(
 	sem1 = stats.sem(scalar, axis=0)
 	ax2.plot(params, mean1, color=color, label=r"Stability ($Z^s$)")
 	ax2.axhline(0, color='black', linestyle='--', alpha=0.5) # The Zero Crossing
+	# ax2.axvline(flags.damping + flags., color='black', linestyle='.-', alpha=0.5) # Threshold
 	ax2.fill_between(params, mean1 - sem1, mean1 + sem1, alpha=0.5, color=color)
 	ax2.set_ylabel(r"$Re(\lambda_{\max})$", color=color)
 	ax2.tick_params(axis='y', labelcolor=color)
@@ -727,7 +687,7 @@ def plot_coordination_snap(
 	ax2.fill_between(params, mean1 - sem1, mean1 + sem1, alpha=0.5, color=color)
 
 	plt.legend()
-	plt.grid()
+	plt.grid(which="both")
 	plt.title('The Coordination Snap: Bifurcation vs. Information')
 
 	plt.savefig(f'snap_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
@@ -749,28 +709,28 @@ if __name__ == "__main__":
 		"name": "force",
 		"min": 1.0,
 		"max": 7,
-		"num_points": 10
+		"num_points": 4
 	}
 
 	parameter_config_gamma = {
 		"name": "damping",
 		"min": 0.0,
-		"max": 6,
-		"num_points": 10
+		"max": 4.5,
+		"num_points": 4
 	}
 
 	parameter_config_eta = {
 		"name": "coupling",
 		"min": 0.0,
 		"max": 1.0,
-		"num_points": 10
+		"num_points": 4
 	}
 
 	parameter_config_kappa = {
 		"name": "learning_rate",
 		"min": 0.0,
-		"max": 0.5,
-		"num_points": 10
+		"max": 0.1,
+		"num_points": 4
 	}
 	# for cfg in [parameter_config_beta, parameter_config_gamma, parameter_config_kappa]:
 	# one_parameter_sweep(SFlags(), simple_simulation, parameter_config_beta)
@@ -832,57 +792,44 @@ if __name__ == "__main__":
 	}
 
 	game = pyspiel.load_game("lewis_signaling", env_config)
-	# two_parameter_sweep(game, SFlags(
-	# 	payoffs="climbing", end_time=0.15, num_iterations=100,
-	# 	log_interval=1, 
-	# 	learning_rate = 0.2,
-	# 	force = 2.5,
-	# 	# force_eps = 0.025,
-	# 	# damping = 1.35,
-	# 	force_eps = 0.01,
-	# 	damping = 1.35,
-	# 	coupling = 0.75, 
-	# ), simple_simulation, parameter_config_beta, parameter_config_gamma, None)
-	# one_parameter_sweep(SFlags(
-	# 	learning_rate = 0.08,
-	# 	force = 2.5,
-	# 	force_eps = 0.025,
-	# 	damping = 1.35,
-	# 	coupling = 0.55,
-	# 	payoffs="classic", end_time=0.15, num_iterations=100, log_interval=1), simple_simulation, parameter_config_beta)
+
+	plot_coordination_snap(SFlags(payoffs="classic", end_time=1., num_iterations=1, log_interval=1), simple_simulation, parameter_config_beta)
+	plot_coordination_snap(SFlags(payoffs="classic", end_time=1., num_iterations=50, log_interval=1), simple_simulation, parameter_config_beta)
+	
 	evaluate_policies(
 		SFlags(
-			payoffs="climbing", 
+			payoffs="classic", 
 			end_time=0.15, 
-			num_iterations=80, 
-			log_interval=1, 
-			learning_rate = 0.08,
-			force = 2.5,
-			# force_eps = 0.025,
-			# damping = 1.35,
-			force_eps = 0.01,
-			damping = 1.25,
-			coupling = 0.55,
+			num_iterations=110, 
 		), 
 		simple_simulation,
-		role=Role.RECEIVER,
+		role=Role.SENDER, # the game is symmetric, so it doesnt' matter
+		parameter_config=parameter_config_gamma
+	)
+
+	evaluate_policies(
+		SFlags(
+			payoffs="prisoner_dilemma", 
+			end_time=0.15, 
+			num_iterations=110, 
+		), 
+		simple_simulation,
+		role=Role.SENDER,
+		parameter_config=parameter_config_gamma
+	)
+
+	evaluate_policies(
+		SFlags(
+			payoffs="classic", 
+			end_time=0.15, 
+			num_iterations=110, 
+		), 
+		simple_simulation,
+		role=Role.SENDER,
 		parameter_config=parameter_config_beta
 	)
-	# plot_coordination_snap(SFlags(payoffs="prisoner_dilemma", end_time=0.15, num_iterations=30, log_interval=1), simple_simulation, parameter_config_beta)
-	# plot_coordination_snap(SFlags(
-	# 		payoffs="classic", 
-	# 		end_time=0.15, 
-	# 		num_iterations=100, 
-	# 		log_interval=1, 
-	# 		learning_rate = 0.1,
-	# 		force_eps = 0.02,
-	# 		damping = 1.3,
-	# 		coupling = 0.45), simple_simulation, parameter_config_beta)
 
-	
-	# hysteresis(SFlags(payoffs="classic", end_time=0.25, num_iterations=50, log_interval=1), simple_simulation, parameter_config_beta)
-	# hysteresis(SFlags(), simple_simulation, parameter_config1, Role.RECEIVER)
-
-	# plot_biffurcation(SFlags(payoffs="classic", end_time=0.15, num_iterations=10, log_interval=1), parameter_config_beta)
-	
-
+	two_parameter_sweep(game, SFlags(
+		payoffs="classic", end_time=1.0, num_iterations=50,
+		log_interval=1, 
+	), simple_simulation, parameter_config_beta, parameter_config_gamma, None)

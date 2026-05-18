@@ -32,32 +32,11 @@ class Flags(NamedTuple):
 	end_time: float = 0.5
 	baseline_alpha: float = 0.01
 
-
-	# learning_rate: float = 0.05
-	# force: float = 4.5
-	# force_eps: float = 0.01
-	# damping: float = 1.5
-	# coupling: float = 0.5
-
-	learning_rate: float = 0.01
-	force: float = 5.0
-	force_eps: float = 0.01
-	damping: float = 1.
-	coupling: float = 0.67
-	
-	## Classic coordination
-	# learning_rate: float = 0.05
-	# force: float = 2.0
-	# force_eps: float = 0.025
-	# damping: float = 1.35
-	# coupling: float = 0.55
-
-	## Stag Hunt
-	# learning_rate: float = 0.1
-	# force: float = 3.5
-	# force_eps: float = 0.01
-	# damping: float = 1.25
-	# coupling: float = 0.55
+	learning_rate: float = 0.1
+	force: float = 2.5
+	force_eps: float = 0.025
+	damping: float = 1.25
+	coupling: float = 0.55
 	
 	seed: int = 42
 
