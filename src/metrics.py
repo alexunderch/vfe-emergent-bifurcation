@@ -2,6 +2,9 @@ import jax
 import jax.numpy as jnp
 import chex
 
+from open_spiel.python.algorithms import exploitability
+from open_spiel.python import policy
+
 SMALL_NUMBER = 1e-20
 
 
@@ -9,45 +12,23 @@ def calculate_social_metrics(pi_s, pi_r):
     """
     Calculates the informational state of the Sender-Receiver system.
     """
-    def get_joint_wa(pi_s, pi_):
-        """Computes P(W, A) by marginalizing over messages M."""
-        
-        # Assume uniform prior over world states P(w)
-        num_states = pi_s.shape[0]
-        p_w = jnp.ones(num_states) / num_states
-        
-        # Compute P(w, m) = P(w) * P(m|w)
-        p_wm = p_w[:, None] * pi_s
-        
-        # Compute P(w, a) = sum_m P(w, m) * P(a|m)
-        # Using jnp.dot for the marginalization
-        p_wa = jnp.dot(p_wm, pi_r)
-        
-        return p_wa
-    
-    def calculate_h_wa(p_wa):
-        """Computes Joint Entropy H(W, A)."""
-        # Standard Shannon Entropy
-        # We add 1e-10 to avoid log(0)
-        return -jnp.sum(p_wa * jnp.log2(p_wa + 1e-10))
-    
-    def calculate_i_wa(p_wa):
-        """Computes Mutual Information I(W, A)."""
-        # Marginal distributions
-        p_w = jnp.sum(p_wa, axis=1) # Marginal of W
-        p_a = jnp.sum(p_wa, axis=0) # Marginal of A
-        
-        # Individual Entropies
-        h_w = -jnp.sum(p_w * jnp.log2(p_w + 1e-10))
-        h_a = -jnp.sum(p_a * jnp.log2(p_a + 1e-10))
-        h_wa = calculate_h_wa(p_wa)
-        
-        # I(W; A) = H(W) + H(A) - H(W, A)
-        return h_w + h_a - h_wa
-    
-    p_wa = get_joint_wa(pi_s, pi_r)
+    n_w = pi_s.shape[0]
+    p_w = jnp.ones(n_w) / n_w
 
-    return  calculate_h_wa(p_wa), calculate_i_wa(p_wa)
+    p_wa = jnp.einsum("w,wm,ma->wa", p_w, pi_s, pi_r)
+    p_w_m = p_wa.sum(axis=1)
+    p_a_m = p_wa.sum(axis=0)
+    
+    eps = 1e-12
+    
+    h_wa = -jnp.sum(p_wa * jnp.log2(p_wa + eps))
+    h_w  = -jnp.sum(p_w_m * jnp.log2(p_w_m + eps))
+    h_a  = -jnp.sum(p_a_m * jnp.log2(p_a_m + eps))
+    
+    return h_wa, h_w + h_a - h_wa
+   
+
+
 
 def calculate_coordination_success(policy: chex.Array) -> float:
   
@@ -168,3 +149,95 @@ def calculate_cic(speaker_probs, listener_probs):
     cic = jnp.mean(inner_sum)
 
     return cic
+
+
+def compute_coordination_success_analytical(pi_s, pi_r, U):
+    """
+    Greedy coordination: sender picks argmax message, receiver picks argmax action.
+    """
+    best_actions = U.argmax(axis=1)
+    # Greedy sender: m*(w) = argmax_m Z_s[w,m]
+    msg_greedy = pi_s.argmax(axis=1)
+    # Greedy receiver: a*(m) = argmax_a Z_r[m,a]
+    act_greedy = pi_r[msg_greedy].argmax(axis=1)
+    
+    return jnp.mean((act_greedy == best_actions).astype(jnp.float32))
+
+
+def compute_expected_reward(pi_s, pi_r, p_w, U):
+    """Exact E[U] from policies."""
+    return jnp.einsum("w,wm,ma,wa->", p_w, pi_s, pi_r, U)
+
+def get_observation_index(state, player_id: int) -> int:
+  """
+  Extracts the observation tensor from OpenSpiel and converts it 
+  to an integer index for the Z matrix.
+  """
+  obs_tensor = state.observation_tensor(player_id)
+  
+  # Convert to index using argmax
+  # If the world is State 1, the tensor might be [0, 1, 0]. Argmax returns 1.
+  obs_index = obs_tensor[3:].index(1)
+  
+  return int(obs_index)
+
+class MatrixSignalingPolicy(policy.Policy):
+	def __init__(self, game, sender_matrix, receiver_matrix):
+		"""
+		Args:
+				game: The OpenSpiel game instance.
+				sender_matrix: 2D array of shape (num_states, num_messages). 
+												Rows sum to 1.
+				receiver_matrix: 2D array of shape (num_messages, num_actions). 
+													Rows sum to 1.
+		"""
+		super().__init__(game, player_ids=[0, 1])
+		self.matrices = {
+			0: sender_matrix,
+			1: receiver_matrix
+		}
+
+		num_states, num_messages = sender_matrix.shape
+		assert jnp.allclose(
+				sender_matrix.sum(1), jnp.ones(num_states), atol=1e-1
+		), sender_matrix.sum(1)
+		num_messages, num_actions = receiver_matrix.shape
+		assert jnp.allclose(
+				receiver_matrix.sum(1), jnp.ones(num_messages), atol=1e-1
+		), receiver_matrix.sum(1)
+
+		self.legal_actions = {
+			0: num_messages,
+			1: num_actions
+		}
+
+	def action_probabilities(self, state, player_id=None):
+		if player_id is None:
+			player_id = state.current_player()
+
+		obs_idx = get_observation_index(state, player_id)
+
+		probs = self.matrices[player_id][obs_idx]
+		legal_actions = range(self.legal_actions[player_id])
+		
+		# Dictionary comprehension is faster and cleaner
+		action_probs = {action: float(probs[action]) for action in legal_actions}
+		
+		total_prob = sum(action_probs.values())
+		if total_prob > 0:
+				return {a: p for a, p in action_probs.items()}
+		
+		# Fallback to uniform if something is broken
+		return {a: 1.0 / len(legal_actions) for a in legal_actions}
+
+def calculate_exploitability(game, sender_beliefs, receiver_beliefs) -> float:
+
+    wrapped_policy = MatrixSignalingPolicy(game, sender_beliefs, receiver_beliefs)
+    
+    # 2. Calculate NashConv
+    nash_conv_value = exploitability.nash_conv(game, wrapped_policy)
+	
+    s_br_utility = exploitability.best_response(game, wrapped_policy, 0)
+    r_br_utility = exploitability.best_response(game, wrapped_policy, 1)
+    
+    return nash_conv_value, (s_br_utility, r_br_utility)
