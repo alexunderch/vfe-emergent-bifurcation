@@ -1,25 +1,32 @@
+import enum
+from typing import Callable
+
+import jax
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-from typing import Callable
-import enum
 import pyspiel
+from scipy import stats
+import pandas as pd
 
+from metrics import (
+	calculate_cic,
+	calculate_exploitability,
+	calculate_free_energy,
+	calculate_mi,
+	calculate_social_metrics,
+)
+from neural_evolution import Flags as NFlags
+from neural_evolution import run_simulation as neural_simulation
 from simple_evolution import (
-	Flags as SFlags, 
-	run_simulation as simple_simulation,
+	Flags as SFlags,
+)
+from simple_evolution import (
 	get_policy_from_logits,
 )
-
-from neural_evolution import (
-	Flags as NFlags, 
-	run_simulation as neural_simulation
+from simple_evolution import (
+	run_simulation as simple_simulation,
 )
-
-from metrics import calculate_mi, calculate_social_metrics, calculate_cic, calculate_free_energy, calculate_exploitability
-from scipy import stats 
-import jax
-import jax.numpy as jnp
 
 class Role(enum.StrEnum):
 	SENDER = "sender"
@@ -36,6 +43,7 @@ mpl.rcParams.update(params)
 
 
 def one_parameter_sweep(
+	game: pyspiel.Game,
 	flags: SFlags, 
 	sim: Callable,
 	parameter_config: dict
@@ -62,7 +70,7 @@ def one_parameter_sweep(
 		)
 		mi_sender.append(calculate_mi(sender_policy))
 		mi_receiver.append(calculate_mi(receiver_policy))
-		joint_mi.append(calculate_social_metrics(sender_policy, receiver_policy)[1])
+		joint_mi.append(calculate_social_metrics(sender_policy, receiver_policy)[2])
 		cic.append(calculate_cic(sender_policy, receiver_policy))
 		vfe.append(calculate_free_energy(sender_policy)+calculate_free_energy(receiver_policy))
 		expl.append(calculate_exploitability(game, sender_policy, receiver_policy)[0])
@@ -92,12 +100,10 @@ def one_parameter_sweep(
 	plt.show()
 
 def two_parameter_sweep(
-	game,
 	flags:  SFlags, 
 	sim: Callable,
 	parameter_config_lhs: dict,
 	parameter_config_rhs: dict,
-	metric: Callable
 ):
   
 	assert "name" in parameter_config_lhs and "name" in parameter_config_rhs
@@ -109,16 +115,16 @@ def two_parameter_sweep(
 	params_lhs = np.linspace(parameter_config_lhs["min"], parameter_config_lhs["max"], parameter_config_lhs["num_points"])
 	params_rhs = np.linspace(parameter_config_rhs["min"], parameter_config_rhs["max"], parameter_config_rhs["num_points"])
 	results = np.zeros((len(params_lhs), len(params_rhs)))
-	results_reward = np.zeros((len(params_lhs), len(params_rhs)))
+	# results_reward = np.zeros((len(params_lhs), len(params_rhs)))
 
-	rng = jax.random.key(flags.seed)
-	param_names = dict(
-	learning_rate = r"$\kappa$",
-	force = r"$\beta$",
-	force_eps = r"$\epsilon$",
-	damping = r"$\gamma$",
-	coupling = r"$\eta$",
-	)
+	# rng = jax.random.key(flags.seed)
+	# param_names = dict(
+	# learning_rate = r"$\kappa$",
+	# force = r"$\beta$",
+	# force_eps = r"$\epsilon$",
+	# damping = r"$\gamma$",
+	# coupling = r"$\eta$",
+	# )
 
 	for i, alpha in enumerate(params_lhs):
 		for j, beta in enumerate(params_rhs):
@@ -155,8 +161,6 @@ def plot_comparison(ode_logs, neural_logs, save_path):
 	ode_eig_std = stats.sem(ode_eig_all, axis=0)
 	xs = np.arange(ode_mi_all.shape[1])
 
-	ode_coord_all = np.array(ode_logs["coordination_success"])
-	ode_coord_mean = ode_coord_all.mean(axis=0)
 	# --- Neural VFE panels (middle & right: mean ± std over seeds) ---
 
 	mi_all = np.array(neural_logs["joint_mi"])
@@ -165,13 +169,18 @@ def plot_comparison(ode_logs, neural_logs, save_path):
 
 	steps = np.arange(mi_all.shape[1])
 
-
 	eig_all = np.array(neural_logs["leading_eigenvalue"])
 	eig_mean = eig_all.mean(axis=0)
 	eig_std = stats.sem(mi_all, axis=0)
 
 	coord_all = np.array(neural_logs["coordination_success"])
 	coord_mean = coord_all.mean(axis=0)
+	coord_std = stats.sem(coord_all, axis=0)
+
+	ode_coord_all = np.array(ode_logs["coordination_success"])
+	ode_coord_mean = ode_coord_all.mean(axis=0)
+	ode_coord_std = stats.sem(ode_coord_all, axis=0)
+
 
 	axes[0, 0].plot(steps, mi_mean, 'purple', lw=1.5, label="Neural VFE")
 	axes[0, 0].fill_between(steps, mi_mean - mi_std, mi_mean + mi_std, 
@@ -181,9 +190,9 @@ def plot_comparison(ode_logs, neural_logs, save_path):
 	axes[0, 0].fill_between(xs, ode_mi_mean - ode_mi_std, ode_mi_mean + ode_mi_std,  alpha=0.2, color='orange')
 	axes[0, 0].set_title(r"$I(\mathcal{W};\mathcal{A})$")
 	axes[0, 0].set_ylabel("Bits")
-	axes[0, 0].set_xlabel("Training step (Time)")
+	axes[0, 0].set_xlabel("Episodes")
 
-	axes[0, 0].axhline(1.585, color='gray', ls='--', alpha=0.5)
+	axes[0, 0].axhline(1.585, color='gray', ls='--', alpha=0.5, label = "Max MI")
 	axes[0, 0].set_ylim(0, 1.8)
 	axes[0, 0].legend()
 
@@ -194,28 +203,40 @@ def plot_comparison(ode_logs, neural_logs, save_path):
 	axes[1, 0].plot(xs, ode_eig_mean, 'orange', lw=1.5, label="ODE VFE")
 	axes[1, 0].fill_between(xs, ode_eig_mean - ode_eig_std, ode_eig_mean + ode_eig_std,  alpha=0.2, color='orange')
 
-	axes[1, 0].axhline(0, color='r', ls='--', alpha=0.5)
+	axes[1, 0].axhline(0, color='r', ls='--', alpha=0.5, label=r"Re$(\lambda_{\max})=0$")
 	axes[1, 0].set_title(r"Re($\lambda_{\max}$)")
-	axes[1, 0].set_xlabel("Training step (Time)")
+	axes[1, 0].set_xlabel("Episodes")
 	axes[1, 0].set_ylabel("Eigenvalue")
 	axes[1, 0].legend()
 
-
 	# --- Coordination comparison ---
-	axes[0, 1].plot(xs, ode_coord_mean*100, 'orange', lw=1.5, label="ODE")
-	axes[0, 1].plot(steps, coord_mean*100, 'purple', lw=1.5, label="Neural VFE")
+	axes[0, 1].plot(steps, coord_mean, 'purple', lw=1.5, label="Neural VFE")
+	axes[0, 1].fill_between(steps, coord_mean - coord_std, coord_mean + coord_std,  alpha=0.2, color='purple')
+
+	axes[0, 1].plot(xs, ode_coord_mean, 'orange', lw=1.5, label="ODE")
+	axes[0, 1].fill_between(xs, ode_coord_mean - ode_coord_std, ode_coord_mean + ode_coord_std,  alpha=0.2, color='orange')
+	
 	axes[0, 1].set_title("Coordination Success (%)")
 	axes[0, 1].set_ylim(0, 105)
+	axes[0, 1].set_xlabel("Episodes")
 	axes[0, 1].legend()
 
 	# --- VFE descent curve ---
-	vfe_all = np.array(neural_logs["loss"])
+	vfe_all = np.array(neural_logs["free_energy_dyn"])
 	vfe_mean = vfe_all.mean(axis=0)
 	vfe_std = stats.sem(vfe_all, axis=0)
-	axes[1, 1].plot(steps, vfe_mean, 'darkblue', lw=1.5)
-	axes[1, 1].fill_between(xs, vfe_mean - vfe_std, vfe_mean + vfe_std,  alpha=0.2, color='darkblue')
-	axes[1, 1].set_title(r"Neural VFE: $\mathcal{F}(Z)$ descent")
-	axes[1, 1].set_xlabel("Training step")
+
+	ode_vfe_all = np.array(ode_logs["free_energy_dyn"])
+	ode_vfe_mean = ode_vfe_all.mean(axis=0)
+	ode_vfe_std = stats.sem(ode_vfe_all, axis=0)
+
+	axes[1, 1].plot(steps, vfe_mean, 'purple', lw=1.5, label="Neural VFE")
+	axes[1, 1].fill_between(steps, vfe_mean - vfe_std, vfe_mean + vfe_std,  alpha=0.2, color='purple')
+
+	axes[1, 1].plot(xs, ode_vfe_mean, 'orange', lw=1.5, label="ODE VFE")
+	axes[1, 1].fill_between(xs, ode_vfe_mean - ode_vfe_std, ode_vfe_mean + ode_vfe_std,  alpha=0.2, color='orange')
+	axes[1, 1].set_title(r"$\mathcal{F}(Z)$ descent")
+	axes[1, 1].set_xlabel("Episodes")
 	axes[1, 1].set_ylabel("VFE potential")
 
 	for ax in axes.flat:
@@ -247,12 +268,12 @@ def hysteresis(
 	mi_forward = []
 	for p in params:
 		# mi_forward.append(calculate_mi(sender_beliefs if role == Role.SENDER else receiver_beliefs))
-		(sender_beliefs, receiver_beliefs), _ =sim(flags._replace(**{param_name: p}), return_logs=False)
+		(sender_beliefs, receiver_beliefs), _ =sim(flags._replace(**{param_name: p}))
 		sender_policy, receiver_policy = jax.tree.map(
-				lambda x: get_policy_from_logits(x, flags.force), (sender_beliefs, receiver_beliefs)
+				lambda x: get_policy_from_logits(x, flags.temperature), (sender_beliefs, receiver_beliefs)
 		)
 
-		mi_forward.append(calculate_social_metrics(sender_policy, receiver_policy)[1])
+		mi_forward.append(calculate_social_metrics(sender_policy, receiver_policy)[2])
 
 
   	# 2. BACKWARD SWEEP (Ramp Down)
@@ -261,12 +282,12 @@ def hysteresis(
 	# (sender_beliefs, receiver_beliefs), _ = sim(flags._replace(**{param_name: params[-1]}))
 	for b in reversed(params):
 
-		(sender_beliefs, receiver_beliefs), _ =sim(flags._replace(**{param_name: b}), (sender_beliefs, receiver_beliefs), return_logs=False)
+		(sender_beliefs, receiver_beliefs), _ =sim(flags._replace(**{param_name: b}), (sender_beliefs, receiver_beliefs))
 		sender_policy, receiver_policy = jax.tree.map(
-			lambda x: get_policy_from_logits(x, flags.force), (sender_beliefs, receiver_beliefs)
+			lambda x: get_policy_from_logits(x, flags.temperature), (sender_beliefs, receiver_beliefs)
 		)
 
-		mi_backward.append(calculate_social_metrics(sender_policy, receiver_policy)[1])
+		mi_backward.append(calculate_social_metrics(sender_policy, receiver_policy)[2])
 
 	# Reverse the backward results so they align with the 'betas' array
 	mi_backward = mi_backward[::-1]
@@ -289,7 +310,6 @@ def hysteresis(
 def evaluate_policies(
 	flags:  SFlags, 
 	sim: Callable, 
-	role = Role.SENDER, 
 	parameter_config: dict = None
 ):
 	if parameter_config is not None:
@@ -423,19 +443,19 @@ def evaluate_policies(
 		scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
 		ax_labels=["Episodes", "Reward per episode"],
 	)
-	plot_scalars(
-		[l["opts" + ("_r" if role == Role.RECEIVER else "_s")] for l in logs],
-		title="Percentage of optimal actions",
-		scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
-		ax_labels=["Episodes", "% optimal actions"],
-	)
+	# plot_scalars(
+	# 	[l["opts" + ("_r" if role == Role.RECEIVER else "_s")] for l in logs],
+	# 	title="Percentage of optimal actions",
+	# 	scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
+	# 	ax_labels=["Episodes", "% optimal actions"],
+	# )
 
-	plot_scalars(
-		[l["coordination_success" + ("_r" if role == Role.RECEIVER else "_s")] for l in logs],
-		title="Coordination success of the system",
-		scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
-		ax_labels=["Episodes", "% optimal actions"],
-	)
+	# plot_scalars(
+	# 	[l["coordination_success" + ("_r" if role == Role.RECEIVER else "_s")] for l in logs],
+	# 	title="Coordination success of the system",
+	# 	scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
+	# 	ax_labels=["Episodes", "% optimal actions"],
+	# )
 
 	plot_scalars(
 		[l["coordination_success"] for l in logs],
@@ -446,10 +466,17 @@ def evaluate_policies(
 
 
 	plot_scalars(
-		[l["free_energy" + ("_r" if role == Role.RECEIVER else "_s")] for l in logs],
-		title="Free energy of the system",
+		[l["free_energy_dyn"] for l in logs],
+		title="Potential Free energy of the system",
 		scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
-		ax_labels=["Episodes", "VFE (bits)"],
+		ax_labels=["Episodes", "VFE"],
+	)
+
+	plot_scalars(
+		[l["free_energy_mi"] for l in logs],
+		title="Variational Free energy of the system",
+		scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
+		ax_labels=["Episodes", "VFE"],
 	)
 
 	plot_scalars(
@@ -480,16 +507,38 @@ def evaluate_policies(
 		ax_labels=["Episodes", "NashConv"],
 	)
 
-	plot_confusion_matrix(
-		logs[0]["convergence_point"].astype(int), title="Final policy"
-	)
+	# plot_confusion_matrix(
+	# 	logs[0]["convergence_point"].astype(int), title="Final policy"
+	# )
+	
+	if parameter_config is not None:
+		print_data = []
+		for log, p in zip(logs, params):
+			zc = []
+			for seed in log["leading_eigenvalue"]:
+				val = np.where(np.diff(np.sign(seed)))[0]
+				if len(val) == 0:
+					val = [1000]
+				zc.append(val[0])
+			zc = np.array(zc)
+
+			print_data.append({
+				f"Parameter {param_names[param_name]}": f"{p:.1f}",
+				"NashConv": f"{log["expl"][:, -1].mean(0):.2f}±{stats.sem(log["expl"][:, -1], axis=0):.2f}",
+				r"Re(\lambda_{\max})": f"{log["leading_eigenvalue"][:, -1].mean(0):.2f}±{stats.sem(log["leading_eigenvalue"][:, -1], axis=0):.2f}",
+				r"MI": f"{log["joint_mi"][:, -1].mean(0):.2f}±{stats.sem(log["joint_mi"][:, -1], axis=0):.2f}",
+				r"Coord. Success": f"{log["coordination_success"][:, -1].mean(0):.2f}±{stats.sem(log["coordination_success"][:, -1], axis=0):.2f}",
+				"Emergence time": f"{zc.mean():.2f}±{stats.sem(zc, axis=0) if zc.mean() != np.inf else np.inf:.2f}"
+			})
+		print(pd.DataFrame(print_data))
 
 	plt.show()
 
 def plot_coordination_snap(	
 	flags:  SFlags, 
 	sim: Callable, 
-	parameter_config: dict
+	parameter_config: dict,
+	origin: bool = False,
 ):
 	# --- SWEEP : Varying a parameter ---
 
@@ -500,28 +549,27 @@ def plot_coordination_snap(
 	
 
 	param_name = parameter_config["name"]
-	params = np.linspace(parameter_config["min"], parameter_config["max"], parameter_config["num_points"])
+	params = np.arange(parameter_config["min"], parameter_config["max"], parameter_config["num_points"])
 	joint_mi, eigs = [], []
 
 	for p in params:
 		flags = flags._replace(**{param_name: p})
 		_, logs = sim(flags)
-		joint_mi.append(logs["joint_mi"][:, -1])
-		eigs.append(logs["leading_eigenvalue"][:, -1])
-		# eig_r.append(logs["leading_eigenvalue"][:, -1])
+		joint_mi.append(logs["joint_mi"].max(-1))
+		eigs.append(logs["leading_eigenvalue"][:, 0 if origin else -1]) #at the origin
+		print(p, np.mean(eigs[-1]), np.mean(joint_mi[-1]))
 
-	
 	fig, ax1 = plt.subplots(figsize=(10, 7))
 
 	# Axis 1: Mutual Information
 	color = 'tab:red'
 	scalar = np.array(joint_mi).transpose()
-	xs = np.arange(scalar.shape[1]) * flags.num_saves
 	mean1 = scalar.mean(axis=0)
 	sem1 = stats.sem(scalar, axis=0)
 	ln1 = ax1.plot(params, mean1, color=color, label="Coordination")
 	ax1.fill_between(params, mean1 - sem1, mean1 + sem1, alpha=0.5,  color=color)
 	ax1.set_ylabel(r"joint $I(\mathcal{W}; \mathcal{A})$ bits")
+	ln2 = ax1.axhline(1.58, color='black', linestyle='--', alpha=0.5, label=r"Max MI $=\log_2(3)\approx 1.58$") # The Zero Crossing
 	ax1.set_ylim(0, 1.6) # Max for 3 states is log2(3) ~ 1.58
 	ax1.tick_params(axis='y', labelcolor=color)
 	ax1.set_xlabel(r"Sensitivity $\beta$")
@@ -531,17 +579,18 @@ def plot_coordination_snap(
 	ax2 = ax1.twinx()
 	color = 'tab:blue'
 	scalar = np.array(eigs).transpose()
-	xs = np.arange(scalar.shape[1]) * flags.num_saves
 	mean1 = scalar.mean(axis=0)
 	sem1 = stats.sem(scalar, axis=0)
-	ln2 = ax2.plot(params, mean1, color=color, label=r"Stability of Z=$(Z^s, Z^r)$")
-	ax2.axhline(0, color='black', linestyle='--', alpha=0.5) # The Zero Crossing
-	ax2.axvline(1.35, color='blue', linestyle='-.', alpha=0.5) # Critical Threshold Crossing
+	ln3 = ax2.plot(params, mean1, color=color, label=r"Cons. lead. eigenval. of Z=$(Z^s, Z^r)$")
+	ln4 = ax2.axvline(0.85, color="black", linestyle='-.', alpha=0.5, label=r"$\mu=\beta_c-\gamma+\eta=0$") #
+	ln5 = ax2.axhline(0, color='black', linestyle='--', alpha=0.5, label=r"Re$(\lambda_{\max})=0$") # The Zero Crossing
+	ln6 = ax2.axhline(-0.85, color='black', linestyle='--', alpha=0.5, label=r"Cons. Re$(\lambda_{\max})=\gamma-\eta$") # The Zero Crossing
 	ax2.fill_between(params, mean1 - sem1, mean1 + sem1, alpha=0.5, color=color)
-	ax2.set_ylabel(r"$Re(\lambda_{\max})$", color=color)
+	ax2.set_ylabel(r"Re$(\lambda_{\max})$", color=color)
 	ax2.tick_params(axis='y', labelcolor=color)
 	
-	lns = ln1+ln2
+	lns = ln1+[ln2]+ln3+[ln4]+[ln5]+[ln6]
+	# lns = ln1+ln3+[ln4]+[ln5]
 	labs = [l.get_label() for l in lns]
 	ax1.legend(lns, labs, loc=0)
 
@@ -555,150 +604,82 @@ def plot_coordination_snap(
 
 if __name__ == "__main__":
 
-	# learning_rate: float = 0.01
-	# temperature: float = 1.0
-	# decay: float = 4.0
-	# force: float = 0.1
-	# damping: float = 1.8
-	# coupling: float = 1.2
-	# symm_break: float = 1.0
+	parameter_config_beta = {
+		"name": "force",
+		"min": 0.35,
+		"max": 5.0,
+		"num_points": 0.5
+	}
 
+	plot_coordination_snap(
+		SFlags(payoffs="classic", end_time=1.0, num_iterations=1, force_eps=0.0), #approx. analytic Jacobian
+		simple_simulation, 
+		parameter_config_beta,
+		origin=True
+	)
+
+	plot_coordination_snap(
+		SFlags(payoffs="classic", end_time=100.0, num_iterations=1, force_eps=0.0), 
+		simple_simulation, 
+		parameter_config_beta
+	)
+	
 	parameter_config_beta = {
 		"name": "force",
 		"min": 1.0,
-		"max": 7,
+		"max": 5.0,
 		"num_points": 4
 	}
 
 	parameter_config_gamma = {
 		"name": "damping",
 		"min": 0.0,
-		"max": 5.5,
+		"max": 4.5,
 		"num_points": 4
 	}
 
 	parameter_config_eta = {
 		"name": "coupling",
 		"min": 0.0,
-		"max": 1.5,
+		"max": 1.2,
 		"num_points": 4
 	}
-
+	
 	parameter_config_kappa = {
 		"name": "learning_rate",
 		"min": 0.0,
-		"max": 5.0,
+		"max": 4.5,
 		"num_points": 4
 	}
-	# for cfg in [parameter_config_beta, parameter_config_gamma, parameter_config_kappa]:
-	# one_parameter_sweep(SFlags(), simple_simulation, parameter_config_beta)
-	game = "lewis_signaling"
-	flags = SFlags(payoffs="climbing")
 	
-	#game parameters
-	num_players = 2
-	num_states = flags.num_states
-	num_messages = flags.num_messages
-    
-
-	if flags.payoffs == "random":
-		payoffs = np.random.random((num_states, num_states))
-		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])		
-	elif flags.payoffs == "classic":
-		payoffs_list = [1, 0, 0, 0, 1, 0, 0, 0, 1]
-		payoffs = np.array(payoffs_list).reshape((num_states, num_states))
-		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])
-	elif flags.payoffs == "penalty":
-		payoffs = np.array([[10, -10, 1], [-10, 10, 1], [1, 1, 2]])
-		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])
-	elif flags.payoffs == "prisoner_dilemma":
-		payoffs = np.array([[2, 0], [3, 1]])
-		num_states = num_messages = 2
-		payoffs = payoffs.reshape((num_states, num_states))
-		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])
-	elif flags.payoffs == "hawk_and_dove":
-		payoffs = np.array([[1, 7], [2, 3]])
-		num_states = num_messages = 2
-		payoffs = payoffs.reshape((num_states, num_states))
-		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])
-	elif flags.payoffs == "bottleneck":
-		payoffs = np.array([[11, 0, 0], [0, 7, 6], [0, 6, 7]])
-		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])
-	elif flags.payoffs == "climbing":
-    # This is a particular payoff matrix that is hard for decentralized
-    # algorithms. Introduced in C. Claus and C. Boutilier, "The dynamics of
-    # reinforcement learning in cooperative multiagent systems", 1998, for
-    # simultaneous action games, but it is difficult even in the case of
-    # signaling games.
-		payoffs = np.array([[11, -30, 0], [-30, 7, 6], [0, 0, 5]]) / 30
-		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])
-	else:
-		payoffs_str = flags.payoffs
-		try:
-			payoffs_list = [float(x) for x in payoffs_str.split(",")]
-			payoffs = np.array(payoffs_list).reshape((num_states, num_states))
-		except ValueError:
-			raise ValueError(
-					"There should be {} (states * actions) elements in payoff. "
-					"Found {} elements".format(num_states * num_states, len(payoffs_list))
-			) from None
-
-	env_config = {
-			"num_states": num_states,
-			"num_messages": num_messages,
-			"payoffs": payoffs_str,
-	}
-
-	game = pyspiel.load_game("lewis_signaling", env_config)
-
-	parameter_config_beta = {
-		"name": "force",
-		"min": 1.0,
-		"max": 10,
-		"num_points": 10
-	}
-
-	plot_coordination_snap(SFlags(payoffs="classic", end_time=10.0, num_iterations=1), simple_simulation, parameter_config_beta)
-	plot_coordination_snap(SFlags(payoffs="classic", end_time=10.0, num_iterations=10,), simple_simulation, parameter_config_beta)
-	
-	parameter_config_beta = {
-		"name": "force",
-		"min": 1.0,
-		"max": 5.0,
-		"num_points": 4
-	}
 	evaluate_policies(
 		SFlags(
 			payoffs="classic", 
-			end_time=10.0, 
+			end_time=100.0, 
 			num_iterations=1, 
 		), 
 		simple_simulation,
-		role=Role.SENDER, # the game is symmetric, so it doesnt' matter
+		# parameter_config=parameter_config_beta
+	)
+
+	evaluate_policies(
+		NFlags(
+			payoffs="classic", 
+			num_iterations=10000, 
+		), 
+		neural_simulation,
 		parameter_config=parameter_config_beta
 	)
 
 
-	evaluate_policies(
-		SFlags(
-			# payoffs="prisoner_dilemma", 
-			payoffs="classic", 
-			end_time=10.0, 
-			num_iterations=1, 
-		), 
-		simple_simulation,
-		role=Role.SENDER,
-		parameter_config=parameter_config_gamma
-	)
 
 	evaluate_policies(
 		SFlags(
 			payoffs="classic", 
-			end_time=10.0, 
+			end_time=100.0, 
 			num_iterations=1, 
 		), 
 		simple_simulation,
-		role=Role.SENDER,
 		parameter_config=parameter_config_kappa
 	)
 
@@ -715,22 +696,22 @@ if __name__ == "__main__":
 		"num_points": 10
 	}
 
-	two_parameter_sweep(game, SFlags(
-		payoffs="climbing", end_time=10.0, num_iterations=1,
+	two_parameter_sweep(SFlags(
+		payoffs="climbing", end_time=100.0, num_iterations=1,
 	), simple_simulation, parameter_config_beta, parameter_config_gamma, None)
 
 	evaluate_policies(
 		NFlags(
 			payoffs="classic", 
-			num_iterations=500, 
+			num_iterations=10000, 
+			num_runs=20
 		), 
 		neural_simulation,
-		role=Role.SENDER, # the game is symmetric, so it doesnt' matter
 		parameter_config=parameter_config_beta
 	)
 
-	_, ode_logs = simple_simulation(SFlags(payoffs="classic", end_time=10.0, num_iterations=1, learning_rate=5.0))
-	_, neural_logs = neural_simulation(NFlags(payoffs="classic", num_iterations=int(1e2), lr=1e-2, learning_rate=5.0))
+	_, ode_logs = simple_simulation(SFlags(payoffs="classic", end_time=10.0, num_iterations=1))
+	_, neural_logs = neural_simulation(NFlags(payoffs="classic", num_iterations=int(1e2), lr=1e-2))
 	plot_comparison(ode_logs, neural_logs, "./fig_neural_vfe.pdf")
 
 	# Correlation analysis

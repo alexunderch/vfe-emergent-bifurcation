@@ -1,24 +1,24 @@
+from functools import partial
+from typing import NamedTuple
+
+import chex
 import jax
 import jax.numpy as jnp
-import optax
-from typing import NamedTuple, Dict
-from functools import partial
 import numpy as np
-from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
-import chex
-
+import optax
 import pyspiel
+from tqdm.auto import tqdm
 
 from metrics import (
-	calculate_social_metrics, 
-	calculate_free_energy, 
-	calculate_cic,
-    compute_expected_reward,
+    calculate_cic,
+    calculate_exploitability,
+    calculate_free_energy,
+	dynamical_vfe,
+    calculate_social_metrics,
     compute_coordination_success_analytical,
-    calculate_exploitability
+    compute_expected_reward,
+	calculate_laplacian_inhibition
 )
-
 
 """
 neural_vfe_baseline.py
@@ -27,28 +27,28 @@ Neural VFE Dynamics baseline for Lewis signalling game.
 Key difference from REINFORCE:
 - Loss = VFE potential F(Z) from Eq. 12 (NOT just expected utility)
 - Network trained by VFE descent = discretized ODE flow
-- Spectral diagnostic (Jacobian of ODE field at network outputs) tracks emergence
+- Spectral diagnostic (Jacobian of **ODE** field at network outputs) tracks emergence
 """
 
 class Flags(NamedTuple):
-    num_states: int = 3 
-    num_messages: int = 3 
-    num_actions: int = 3
-    hidden: int = 64
+	num_states: int = 3 
+	num_messages: int = 3 
+	num_actions: int = 3
+	hidden: int = 64
 
-    payoffs: str = "classic"
-    num_runs: int = 5
-    num_iterations: int = 100
+	payoffs: str = "classic"
+	num_runs: int = 20
+	num_iterations: int = 100
 
-    temperature: float = 1.0
-    learning_rate: float = 1.0
-    lr: float = 0.001
-    force: float = 2.5
-    force_eps: float = 0.01
-    damping: float = 1.25
-    coupling: float = 0.55
+	lr: float = 0.01
+	temperature: float = 1.0
+	learning_rate: float = 3.0
+	force: float = 2.5
+	force_eps: float = 0.025
+	damping: float = 1.35
+	coupling: float = 0.5
 
-    seed: int = 42
+	seed: int = 42
 
 
 class SenderNet(NamedTuple):
@@ -85,11 +85,6 @@ def forward(net, x):
     h = jax.nn.relu(x @ net.W1 + net.b1)
     return h @ net.W2 + net.b2
 
-
-# ============================================================
-# IMPLICIT Z MATRICES (network outputs for all inputs)
-# ============================================================
-
 def get_implicit_Z(sender_net, receiver_net, flags: Flags):
     """
     Evaluate network on all possible inputs to recover the full Z matrices.
@@ -100,34 +95,41 @@ def get_implicit_Z(sender_net, receiver_net, flags: Flags):
     msgs = jnp.eye(flags.num_messages)
     
     Z_s = jax.vmap(lambda s: forward(sender_net, s))(states)      # (W, M)
-    Z_r = jax.vmap(lambda m: forward(receiver_net, m))(msgs)     # (M, A)
+    Z_r = jax.vmap(lambda m: forward(receiver_net, m))(msgs)      # (M, A)
     
     return Z_s, Z_r
 
-
-# ============================================================
-# POLICY & UTILITY HELPERS
-# ============================================================
 def get_policy_from_logits(logits: chex.Array, temperature: float) -> chex.Array:
   """Converts internal beliefs into a valid probability distribution."""
   return jax.nn.softmax(logits * temperature)
 
 
-def expected_utility(Z_s, Z_r, U, p_w, temp=1.0):
-    pi_s = get_policy_from_logits(Z_s, temp)
-    pi_r = get_policy_from_logits(Z_r, temp)
-    return jnp.einsum("w,wm,ma,wa->", p_w, pi_s, pi_r, U)
+def expected_utility(
+	Z_s: chex.Array, 
+	Z_r: chex.Array, 
+	U: chex.Array, 
+	p_w: chex.Array, 
+	temp: float = 1.0
+) -> chex.Array:
+	"""Computing expected utility"""
+	pi_s = get_policy_from_logits(Z_s, temp)	
+	pi_r = get_policy_from_logits(Z_r, temp)
+	return jnp.einsum("w,wm,ma,wa->", p_w, pi_s, pi_r, U)
 
-
-def extrinsic_analytical_reward_grad(z_s, z_r, U_mat, p_w, temperature):
+def extrinsic_analytical_reward_grad(
+	Z_s: chex.Array, 
+	Z_r: chex.Array, 
+	U_mat: chex.Array, 
+	p_w: chex.Array, 
+	temperature: float):
     """
-    z_s : (W, M) sender logits
-    z_r : (M, A) receiver logits  
+    Z_s : (W, M) sender logits
+    Z_r : (M, A) receiver logits  
     U_mat : (W, A) shared payoff matrix from OpenSpiel
     p_w : (W,) prior over world states
     """
-    pi_s = get_policy_from_logits(z_s, temperature)   # (W, M)
-    pi_r =  get_policy_from_logits(z_r, temperature)  # (M, A)
+    pi_s = get_policy_from_logits(Z_s, temperature)   # (W, M)
+    pi_r =  get_policy_from_logits(Z_r, temperature)  # (M, A)
     
     # --- Sender: for each (w,m), expected U over receiver's response ---
     # u_s[w,m] = sum_a pi_r[m,a] * U[w,a]
@@ -147,40 +149,6 @@ def extrinsic_analytical_reward_grad(z_s, z_r, U_mat, p_w, temperature):
     
     return grad_s, grad_r
 
-def calculate_laplacian_inhibition(logits: chex.Array):
-    row_sum = jnp.sum(logits, axis=1, keepdims=True) - logits
-    col_sum = jnp.sum(logits, axis=0, keepdims=True) - logits
-    return row_sum + col_sum
-
-
-def vfe_potential(Z_s, Z_r, U, p_w, flags: Flags):
-    """
-    F(Z) = γ/2 ||Z||² - Σ 1/β ln(cosh(βZ+ε)) + η/2 Z^T L Z - κ E[U]
-    """
-
-    # 1. Dissipation (complexity)
-    diss = 0.5 * flags.damping * (jnp.sum(Z_s**2) + jnp.sum(Z_r**2))
-    
-    # 2. Commitment (symmetry-breaking)
-    commit = -(1.0 / flags.force) * (
-        jnp.sum(jnp.log(jnp.cosh(flags.force * Z_s + flags.force_eps))) +
-        jnp.sum(jnp.log(jnp.cosh(flags.force * Z_r + flags.force_eps)))
-    )
-    
-    # 3. Laplacian competition
-    lap_s = 0.5 * flags.coupling * jnp.sum(Z_s * calculate_laplacian_inhibition(Z_s))
-    lap_r = 0.5 * flags.coupling * jnp.sum(Z_r * calculate_laplacian_inhibition(Z_r))
-    
-    # 4. Expected utility (accuracy, negative because F = Complexity - Accuracy)
-    acc = -flags.learning_rate * expected_utility(Z_s, Z_r, U, p_w, flags.temperature)
-    
-    total = diss + commit + lap_s + lap_r + acc
-    return total
-
-
-# ============================================================
-# TRAINING STEP
-# ============================================================
 
 @partial(jax.jit, static_argnames = ("flags", "opts"))
 def train_step(sender_net, receiver_net, state_s, state_r, 
@@ -191,10 +159,9 @@ def train_step(sender_net, receiver_net, state_s, state_r,
 	So this is discretized VFE descent = neuralized ODE flow.
 	"""
 
-
 	def loss_fn(sender_net, receiver_net):
 		Z_s, Z_r = get_implicit_Z(sender_net, receiver_net, flags)
-		return vfe_potential(Z_s, Z_r, U, p_w, flags)
+		return dynamical_vfe(Z_s, Z_r, U, p_w, flags)
 
     # Sender gradient: dF/dθ_s = dF/dZ_s * dZ_s/dθ_s
 	loss_s, grads_s = jax.value_and_grad(
@@ -210,10 +177,10 @@ def train_step(sender_net, receiver_net, state_s, state_r,
 	loss = (loss_s + loss_r) / 2  # They are identical by construction
 
 	opt_s, opt_r = opts
+
 	# Apply updates
 	updates_s, state_s = opt_s.update(grads_s, state_s, sender_net)
 	new_sender = optax.apply_updates(sender_net, updates_s)
-
 
 	updates_r, state_r = opt_r.update(grads_r, state_r, receiver_net)
 	new_receiver = optax.apply_updates(receiver_net, updates_r)
@@ -274,8 +241,15 @@ def ode_vector_field(Z_s, Z_r, U, p_w, flags: Flags):
 	# 3. REINFORCE-like Reward Drive
 	grads_s, grads_r = extrinsic_analytical_reward_grad(Z_s, Z_r, U, p_w, flags.temperature)
 	# 4. Competitive Laplacian (Enforces Uniqueness)
-	dLogits_s = decay_s + tanh_s + flags.learning_rate * grads_s - flags.coupling * calculate_laplacian_inhibition(Z_s) 
-	dLogits_r = decay_r + tanh_r + flags.learning_rate * grads_r - flags.coupling * calculate_laplacian_inhibition(Z_r) 
+	dLogits_s = decay_s \
+				+ tanh_s \
+				+ flags.learning_rate * grads_s \
+				- flags.coupling * calculate_laplacian_inhibition(Z_s) 
+	
+	dLogits_r = decay_r \
+				+ tanh_r \
+				+ flags.learning_rate * grads_r \
+				- flags.coupling * calculate_laplacian_inhibition(Z_r) 
 
 	return jnp.concatenate([dLogits_s.flatten(), dLogits_r.flatten()])
 
@@ -300,8 +274,7 @@ def spectral_diagnostic(Z_s, Z_r, U, p_w, flags):
 
 
 def run_simulation(flags: Flags, beliefs: tuple = None):
-	#game parameters
-	num_players = 2
+
 	num_states = flags.num_states
 	num_messages = flags.num_messages
     
@@ -363,20 +336,17 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 		loss = np.zeros((flags.num_runs, flags.num_iterations)),    
 		leading_eigenvalue = np.zeros((flags.num_runs, flags.num_iterations)),
 		coordination_success = np.zeros((flags.num_runs, flags.num_iterations)),
-		free_energy_s = np.zeros((flags.num_runs, flags.num_iterations)),
-		free_energy_r = np.zeros((flags.num_runs, flags.num_iterations)),
+		free_energy_dyn = np.zeros((flags.num_runs, flags.num_iterations)),
+		free_energy_mi = np.zeros((flags.num_runs, flags.num_iterations)),
 		social_entropy = np.zeros((flags.num_runs, flags.num_iterations)),
 		joint_mi = np.zeros((flags.num_runs, flags.num_iterations)),
 		cic = np.zeros((flags.num_runs, flags.num_iterations)),
 		expl = np.zeros((flags.num_runs, flags.num_iterations)),
-		convergence_point = np.zeros((num_states, num_states)),
-		percent_opt = 0
 	)
 
 	sender_beliefs_= np.zeros((flags.num_runs, num_states, num_messages))
 	receiver_beliefs_ = np.zeros((flags.num_runs, num_messages, num_actions))
 	p_w = jnp.ones(num_states) / num_states
-      
       
 
 	for i in tqdm(range(flags.num_runs), total=flags.num_runs):
@@ -400,7 +370,6 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 		state_s = opt_s.init(sender_params)
 		state_r = opt_r.init(receiver_params)
 
-			
 		for ep in range(flags.num_iterations):
 
 			sender_params, receiver_params, state_s, state_r, loss = train_step(
@@ -409,20 +378,29 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 			sender_beliefs, receiver_beliefs = get_implicit_Z(sender_params, receiver_params, flags)
                   
 			sender_policy, receiver_policy = jax.tree.map(
-				lambda x: get_policy_from_logits(x, flags.temperature), (sender_beliefs, receiver_beliefs)
+				lambda x: get_policy_from_logits(x, flags.temperature), 
+				(sender_beliefs, receiver_beliefs)
 			)
 			
 			cur_idx = (i, ep)
 			expl, _ = calculate_exploitability(game, sender_policy, receiver_policy)  
 
 			logs["loss"][cur_idx] = jnp.mean(loss)
-			logs["leading_eigenvalue"][cur_idx] = spectral_diagnostic(sender_beliefs, receiver_beliefs, payoffs, p_w, flags)
+			logs["leading_eigenvalue"][cur_idx] = spectral_diagnostic(
+				sender_beliefs, receiver_beliefs, payoffs, p_w, flags
+			)
+			p_wa, soc_ent, joint_mi = calculate_social_metrics(sender_policy, receiver_policy) 
 
-			logs["free_energy_s"][cur_idx] = calculate_free_energy(sender_policy) 
-			logs["free_energy_r"][cur_idx] = calculate_free_energy(receiver_policy) 
+			logs["free_energy_dyn"][cur_idx] = dynamical_vfe(
+					sender_beliefs, receiver_beliefs, payoffs, p_w,
+					flags
+				) 
 
+			logs["free_energy_mi"][cur_idx] = calculate_free_energy(
+					sender_policy, receiver_policy, payoffs,
+					flags.learning_rate
+				) 
 
-			soc_ent, joint_mi = calculate_social_metrics(sender_policy, receiver_policy) 
 			logs["social_entropy"][cur_idx] = soc_ent 
 			logs["joint_mi"][cur_idx] = joint_mi 
 			logs["cic"][cur_idx] = calculate_cic(sender_policy, receiver_policy) 
@@ -430,7 +408,7 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
                   
 			logs["coordination_success"][cur_idx] = compute_coordination_success_analytical(
 				sender_policy, receiver_policy, payoffs
-			) 
+			) * 100
                   
 			logs["rewards"][cur_idx] = compute_expected_reward(
 				sender_policy, receiver_policy, p_w, payoffs

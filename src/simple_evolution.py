@@ -1,52 +1,50 @@
-from typing import NamedTuple
+# import copy
 import enum
+from typing import NamedTuple
+
+import chex
+import diffrax
 import jax
 import jax.numpy as jnp
-import diffrax
-
-import pyspiel
-import copy
-
 import numpy as np
-import chex
+import pyspiel
 from tqdm.auto import tqdm
 
-
-
 from metrics import (
-	calculate_coordination_success, 
-	calculate_social_metrics, 
-	calculate_free_energy, 
 	calculate_cic,
 	calculate_exploitability,
+	calculate_free_energy,
+	dynamical_vfe,
+	calculate_social_metrics,
 	compute_coordination_success_analytical,
-	compute_expected_reward
+	compute_expected_reward,
+	calculate_laplacian_inhibition
 )
+
 
 class Flags(NamedTuple):
 	num_states: int = 3 
 	num_messages: int = 3 
 	payoffs: str = "classic"
 	num_iterations: int = 1
-	num_runs: int = 5
+	num_runs: int = 20
 	intergration_step: float = 0.01
 	end_time: float = 0.5
 	num_saves: int = 100
 	baseline_alpha: float = 0.01
 
 	temperature: float = 1.0
-	learning_rate: float = 1.0
+	learning_rate: float = 3.0
 	force: float = 2.5
-	force_eps: float = 0.01
-	damping: float = 1.25
-	coupling: float = 0.55
+	force_eps: float = 0.025
+	damping: float = 1.35
+	coupling: float = 0.5
 	
 	seed: int = 42
 
 class PlayerID(enum.IntEnum):
 	SENDER = 0 
 	RECEIVER = 1
-
 
 def get_policy_from_logits(logits: chex.Array, temperature: float) -> chex.Array:
   """Converts internal beliefs into a valid probability distribution."""
@@ -147,29 +145,6 @@ def extrinsic_analytical_reward_grad(z_s, z_r, U_mat, p_w, temperature):
     
     return grad_s, grad_r
 
-def make_laplacian(n_row, n_col):
-	"""Laplacian for an n_row x n_col matrix.
-	L = L_row + L_col  where each is a complete-graph clique."""
-	I_r, I_c = jnp.eye(n_row), jnp.eye(n_col)
-	J_r, J_c = jnp.ones((n_row, n_row)), jnp.ones((n_col, n_col))
-	# row clique: within each row, all entries connected
-	L_row = jnp.kron(I_r, n_col * I_c - J_c)
-	# column clique: within each col, all entries connected
-	L_col = jnp.kron(n_row * I_r - J_r, I_c)
-	#(L @ logits.flatten()).reshape(shape)
-	return L_row + L_col
-
-def calculate_laplacian_inhibition(logits: chex.Array):
-	"""Constructs the bipartite competition term L*z."""
-	# Row-wise competition: Signals competing for the same world state
-	# We use a simple All-to-All inhibition minus self-feedback
-	row_sum = jnp.sum(logits, axis=1, keepdims=True) - logits
-	
-	# Column-wise competition: World states competing for the same signal
-	col_sum = jnp.sum(logits, axis=0, keepdims=True) - logits
-	
-	return row_sum + col_sum
-
 def corrected_opinion_dynamics(t: chex.Array, x: chex.Array, args: tuple) -> chex.Array:
 	r""" 
 	\dot{z} = -\gamma z + \beta \tanh(z) + \kappa \nabla_{z} \mathbb{E}_{z}R - \eta \mathcal{L}z
@@ -180,13 +155,10 @@ def corrected_opinion_dynamics(t: chex.Array, x: chex.Array, args: tuple) -> che
 	logits_s = x[:thr].reshape(shape_s)
 	logits_r = x[thr:].reshape(shape_r)
 
-	decay_s = -gamma * logits_s
+	decay_s = -(gamma) * logits_s
 	decay_r = -gamma * logits_r
     
-    # 2. Bizyaeva-style cross-inhibition commitment
-    # Within each row (state), messages compete
 	tanh_s = jnp.tanh(beta * logits_s + eps)
-    
 	tanh_r = jnp.tanh(beta * logits_r + eps)
 	
 	n_w = logits_s.shape[0]
@@ -195,20 +167,23 @@ def corrected_opinion_dynamics(t: chex.Array, x: chex.Array, args: tuple) -> che
 	# 3. REINFORCE-like Reward Drive
 	grads_s, grads_r = extrinsic_analytical_reward_grad(logits_s, logits_r, payoffs, p_w, temp)
 	# 4. Competitive Laplacian (Enforces Uniqueness)
-	dLogits_s = decay_s + tanh_s + kappa * grads_s - eta * calculate_laplacian_inhibition(logits_s) 
-	dLogits_r = decay_r + tanh_r + kappa * grads_r - eta * calculate_laplacian_inhibition(logits_r) 
+	dLogits_s = decay_s \
+				+ tanh_s \
+				+ kappa * grads_s \
+				- eta * calculate_laplacian_inhibition(logits_s)
+	 
+	dLogits_r = decay_r \
+				+ tanh_r \
+				+ kappa * grads_r \
+				- eta * calculate_laplacian_inhibition(logits_r) 
 
 	return jnp.concatenate([dLogits_s.flatten(), dLogits_r.flatten()])
 
 def run_simulation(flags: Flags, beliefs: tuple = None):
-	game = "lewis_signaling"
-	
-	#game parameters
-	num_players = 2
+
 	num_states = flags.num_states
 	num_messages = flags.num_messages
     
-
 	if flags.payoffs == "random":
 		payoffs = jnp.asarray(np.random.random((num_states, num_states)))
 		payoffs_str = ",".join([str(x) for x in payoffs.flatten()])		
@@ -266,11 +241,9 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 	logs = dict(
 		rewards = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
 		leading_eigenvalue = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
-		coordination_success_s = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
-		coordination_success_r = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
 		coordination_success = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
-		free_energy_s = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
-		free_energy_r = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
+		free_energy_dyn = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
+		free_energy_mi = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
 		social_entropy = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
 		joint_mi = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
 		cic = np.zeros((flags.num_runs, flags.num_iterations * flags.num_saves)),
@@ -285,7 +258,6 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 
 	for i in tqdm(range(flags.num_runs), total=flags.num_runs):
 		rng = jax.random.key(flags.seed + i)
-		# baseline = jnp.zeros(num_players)
 		
 		# for every run
 		if beliefs is not None:
@@ -308,8 +280,8 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 			receiver_shape = receiver_beliefs.shape
 	
 			base_args = (
-				flags.force, 
-				flags.force, 
+				flags.force,
+				flags.temperature, 
 				flags.force_eps, 
 				flags.damping, 
 				flags.learning_rate,
@@ -346,31 +318,43 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 				args=base_args, 
 				saveat=saveat, 
 				max_steps=int(1e6),
-				# stepsize_controller=diffrax.PIDController(rtol=1e-6, atol=1e-9),
+				stepsize_controller=diffrax.PIDController(rtol=1e-6, atol=1e-9),
 			)
 			thr = num_states*num_messages
 			for t in range(flags.num_saves):
 
 				sender_beliefs, receiver_beliefs = sol.ys[t][:thr], sol.ys[t][thr:]
-				sender_beliefs = jnp.clip(sender_beliefs.reshape(sender_shape), -100, 100)
-				receiver_beliefs = jnp.clip(receiver_beliefs.reshape(receiver_shape), -100, 100)
-
+				# print(jax.tree.map(jnp.linalg.norm, (sender_beliefs, receiver_beliefs)))
+				# sender_beliefs = jnp.clip(sender_beliefs.reshape(sender_shape), -100, 100)
+				# receiver_beliefs = jnp.clip(receiver_beliefs.reshape(receiver_shape), -100, 100)
+				
+				sender_beliefs = sender_beliefs.reshape(sender_shape)
+				receiver_beliefs = receiver_beliefs.reshape(receiver_shape)
+				
 				sender_policy, receiver_policy = jax.tree.map(
-					lambda x: get_policy_from_logits(x, flags.temperature), (sender_beliefs, receiver_beliefs)
+					lambda x: get_policy_from_logits(x, flags.temperature), 
+					(sender_beliefs, receiver_beliefs)
 				)
 				
 				cur_idx = (i, ep * flags.num_saves + t)
 				expl, _ = calculate_exploitability(game, sender_policy, receiver_policy)  
 
-				logs["leading_eigenvalue"][cur_idx] = leading_eig(jnp.concatenate([sender_beliefs.flatten(), receiver_beliefs.flatten()]))
-				logs["coordination_success_s"][cur_idx] = calculate_coordination_success(sender_policy) * 100
-				logs["coordination_success_r"][cur_idx] = calculate_coordination_success(receiver_policy) * 100
+				logs["leading_eigenvalue"][cur_idx] = leading_eig( 
+					jnp.concatenate([sender_beliefs.flatten(), receiver_beliefs.flatten()])
+				) 
 
-				logs["free_energy_s"][cur_idx] = calculate_free_energy(sender_policy) 
-				logs["free_energy_r"][cur_idx] = calculate_free_energy(receiver_policy) 
+				p_wa, soc_ent, joint_mi = calculate_social_metrics(sender_policy, receiver_policy) 
 
+				logs["free_energy_dyn"][cur_idx] = dynamical_vfe(
+					sender_beliefs, receiver_beliefs, payoffs, p_w,
+					flags
+				) 
 
-				soc_ent, joint_mi = calculate_social_metrics(sender_policy, receiver_policy) 
+				logs["free_energy_mi"][cur_idx] = calculate_free_energy(
+					sender_policy, receiver_policy, payoffs,
+					flags.learning_rate
+				) 
+
 				logs["social_entropy"][cur_idx] = soc_ent 
 				logs["joint_mi"][cur_idx] = joint_mi 
 				logs["cic"][cur_idx] = calculate_cic(sender_policy, receiver_policy) 
@@ -384,25 +368,25 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 				) * 100
 
 
-		base_info_state0 = [1.0, 0.0, 0.0] + [0.0] * num_states
-		base_info_state1 = [0.0, 1.0, 0.0] + [0.0] * num_states 
-		rng_s, rng_r, rng = jax.random.split(rng, 3)
+		# base_info_state0 = [1.0, 0.0, 0.0] + [0.0] * num_states
+		# base_info_state1 = [0.0, 1.0, 0.0] + [0.0] * num_states 
+		# rng_s, rng_r, rng = jax.random.split(rng, 3)
 
-		for s in range(num_states):
-			info_state0 = copy.deepcopy(base_info_state0)
-			a_idx = s
-			info_state0[a_idx + 3] = 1.0
-			m = play_step_greedy(sender_beliefs, rng_s, flags.temperature, a_idx)
+		# for s in range(num_states):
+		# 	info_state0 = copy.deepcopy(base_info_state0)
+		# 	a_idx = s
+		# 	info_state0[a_idx + 3] = 1.0
+		# 	m = play_step_greedy(sender_beliefs, rng_s, flags.temperature, a_idx)
 
-			info_state1 = copy.deepcopy(base_info_state1)
-			m_idx = m
-			info_state1[m_idx + 3] = 1.0
-			a = play_step_greedy(receiver_beliefs, rng_r, flags.temperature, m_idx)
+		# 	info_state1 = copy.deepcopy(base_info_state1)
+		# 	m_idx = m
+		# 	info_state1[m_idx + 3] = 1.0
+		# 	a = play_step_greedy(receiver_beliefs, rng_r, flags.temperature, m_idx)
 
-			logs["convergence_point"][s, a] += 1
-			best_act = payoffs[s].argmax()
-			logs["percent_opt"] = int(a == best_act) / flags.num_runs / num_states
-			logs["rewards"][cur_idx] += payoffs[s, a] 
+		# 	logs["convergence_point"][s, a] += 1
+		# 	best_act = payoffs[s].argmax()
+		# 	logs["percent_opt"] = int(a == best_act) / flags.num_runs / num_states
+		# 	logs["rewards"][cur_idx] += payoffs[s, a] 
 
 		sender_beliefs_[i] = sender_beliefs
 		receiver_beliefs_[i] = receiver_beliefs
