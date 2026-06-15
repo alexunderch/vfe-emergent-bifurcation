@@ -18,33 +18,39 @@ from metrics import (
 	calculate_social_metrics,
 	compute_coordination_success_analytical,
 	compute_expected_reward,
-	calculate_laplacian_inhibition
+	calculate_laplacian_inhibition,
+	corrected_laplacian_inhibition,
+	# build_signed_laplacian_signalling_kron as L,
+	make_laplacian2,
+	balanced_laplacian_inhibition,
+	corrected_phi
 )
 
 
 class Flags(NamedTuple):
-	num_states: int = 3 
-	num_messages: int = 3 
-	payoffs: str = "classic"
-	num_iterations: int = 1
-	num_runs: int = 20
+	num_states: int          = 3 
+	num_messages: int        = 3 
+	payoffs: str             = "classic"
+	num_iterations: int      = 1
+	num_runs: int            = 20
 	intergration_step: float = 0.01
-	end_time: float = 0.5
-	num_saves: int = 100
-	baseline_alpha: float = 0.01
+	end_time: float          = 0.5
+	num_saves: int           = 100
+	baseline_alpha: float    = 0.01
 
-	temperature: float = 1.0
-	learning_rate: float = 3.0
-	force: float = 2.5
-	force_eps: float = 0.025
-	damping: float = 1.35
-	coupling: float = 0.5
+	temperature: float    	 = 1.0
+	learning_rate: float  	 = 30.0
+	force: float          	 = 1.0
+	self_attention: float 	 = 2.0
+	eps: float     		  	 = 0.025
+	damping: float        	 = 1.15
+	coupling: float       	 = 0.55
 	
 	seed: int = 42
 
 class PlayerID(enum.IntEnum):
 	SENDER = 0 
-	RECEIVER = 1
+	RECEIVER =  1
 
 def get_policy_from_logits(logits: chex.Array, temperature: float) -> chex.Array:
   """Converts internal beliefs into a valid probability distribution."""
@@ -145,37 +151,51 @@ def extrinsic_analytical_reward_grad(z_s, z_r, U_mat, p_w, temperature):
     
     return grad_s, grad_r
 
-def corrected_opinion_dynamics(t: chex.Array, x: chex.Array, args: tuple) -> chex.Array:
+def new_corrected_opinion_dynamics(t: chex.Array, x: chex.Array, args: tuple) -> chex.Array:
 	r""" 
-	\dot{z} = -\gamma z + \beta \tanh(z) + \kappa \nabla_{z} \mathbb{E}_{z}R - \eta \mathcal{L}z
+	Z_dot = -gamma * Z + u * tanh(alpha * Z + eta * L @ Z + eps) + kappa * sigma(Z) * (U - E_U)z
 	"""
-	beta, temp, eps, gamma, kappa, eta, shape_s, shape_r, payoffs = args
+	u, temp, alpha, eps, gamma, kappa, eta, shape_s, shape_r, payoffs = args
 	
 	thr=shape_s[0]*shape_s[1]
 	logits_s = x[:thr].reshape(shape_s)
 	logits_r = x[thr:].reshape(shape_r)
 
-	decay_s = -(gamma) * logits_s
+	decay_s = -gamma * logits_s
 	decay_r = -gamma * logits_r
-    
-	tanh_s = jnp.tanh(beta * logits_s + eps)
-	tanh_r = jnp.tanh(beta * logits_r + eps)
+
+	# inh = lambda x: (L(x.shape[0]) @ x.reshape(-1)).reshape(x.shape)
+	# print([x.real for x in jnp.linalg.eig(L(3)) ])
+	# tanh_s = u * jnp.tanh(alpha * logits_s + eps + eta * calculate_laplacian_inhibition(logits_s) )
+	# tanh_r = u * jnp.tanh(alpha * logits_r + eps + eta * calculate_laplacian_inhibition(logits_r) )
 	
+	tanh_s = jnp.tanh(alpha * logits_s + eps)
+	tanh_r = jnp.tanh(alpha * logits_r + eps)
+
 	n_w = logits_s.shape[0]
 	p_w = jnp.ones(n_w) / n_w
+	
+	tau = temp * jnp.exp(-0.01 * t)
+	# tau = temp
+
+	# Phi-modulated Laplacian competition
+	phi_s = corrected_phi(logits_r, tau)
+	phi_r = corrected_phi(logits_r, tau)
+
+	L_s = calculate_laplacian_inhibition(logits_s) * phi_s
+	L_r = calculate_laplacian_inhibition(logits_r) * phi_r
 
 	# 3. REINFORCE-like Reward Drive
-	grads_s, grads_r = extrinsic_analytical_reward_grad(logits_s, logits_r, payoffs, p_w, temp)
+	grads_s, grads_r = extrinsic_analytical_reward_grad(logits_s, logits_r, payoffs, p_w, tau)
 	# 4. Competitive Laplacian (Enforces Uniqueness)
 	dLogits_s = decay_s \
 				+ tanh_s \
-				+ kappa * grads_s \
-				- eta * calculate_laplacian_inhibition(logits_s)
-	 
+				+ kappa * grads_s + eta * L_s
+	
 	dLogits_r = decay_r \
 				+ tanh_r \
-				+ kappa * grads_r \
-				- eta * calculate_laplacian_inhibition(logits_r) 
+				+ kappa * grads_r + eta * L_r
+	
 
 	return jnp.concatenate([dLogits_s.flatten(), dLogits_r.flatten()])
 
@@ -282,9 +302,10 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 			base_args = (
 				flags.force,
 				flags.temperature, 
-				flags.force_eps, 
-				flags.damping, 
-				flags.learning_rate,
+				flags.self_attention ,
+				flags.eps, 
+				flags.damping , 
+				flags.learning_rate ,
 				flags.coupling,
 				sender_shape,
 				receiver_shape,
@@ -294,13 +315,13 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 			# --- ODE Integration Step (The Learning) ---
 			
 			# term = diffrax.ODETerm(opinion_dynamics)
-			term = diffrax.ODETerm(corrected_opinion_dynamics) 
+			term = diffrax.ODETerm(new_corrected_opinion_dynamics) 
 			solver = diffrax.Dopri5()
 
 			def leading_eig(z):
 				# differentiate vector field w.r.t. z at a dummy time (autonomous)
 				def func(x):
-					return corrected_opinion_dynamics(0.0, x, base_args)
+					return new_corrected_opinion_dynamics(0.0, x, base_args)
 				jac_fn = jax.jacfwd(lambda z_: func(z_))
 				J = jac_fn(z)
 				eigs = jnp.linalg.eigvals(J)
@@ -318,18 +339,18 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 				args=base_args, 
 				saveat=saveat, 
 				max_steps=int(1e6),
-				stepsize_controller=diffrax.PIDController(rtol=1e-6, atol=1e-9),
+				# stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-6),
 			)
 			thr = num_states*num_messages
 			for t in range(flags.num_saves):
 
 				sender_beliefs, receiver_beliefs = sol.ys[t][:thr], sol.ys[t][thr:]
 				# print(jax.tree.map(jnp.linalg.norm, (sender_beliefs, receiver_beliefs)))
-				# sender_beliefs = jnp.clip(sender_beliefs.reshape(sender_shape), -100, 100)
-				# receiver_beliefs = jnp.clip(receiver_beliefs.reshape(receiver_shape), -100, 100)
+				sender_beliefs = jnp.clip(sender_beliefs.reshape(sender_shape), -1000, 1000)
+				receiver_beliefs = jnp.clip(receiver_beliefs.reshape(receiver_shape), -1000, 1000)
 				
-				sender_beliefs = sender_beliefs.reshape(sender_shape)
-				receiver_beliefs = receiver_beliefs.reshape(receiver_shape)
+				# sender_beliefs = sender_beliefs.reshape(sender_shape)
+				# receiver_beliefs = receiver_beliefs.reshape(receiver_shape)
 				
 				sender_policy, receiver_policy = jax.tree.map(
 					lambda x: get_policy_from_logits(x, flags.temperature), 

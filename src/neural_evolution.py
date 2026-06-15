@@ -17,7 +17,8 @@ from metrics import (
     calculate_social_metrics,
     compute_coordination_success_analytical,
     compute_expected_reward,
-	calculate_laplacian_inhibition
+	calculate_laplacian_inhibition,
+	corrected_phi
 )
 
 """
@@ -38,15 +39,17 @@ class Flags(NamedTuple):
 
 	payoffs: str = "classic"
 	num_runs: int = 20
+	log_every: int  = 1
 	num_iterations: int = 100
 
-	lr: float = 0.01
-	temperature: float = 1.0
-	learning_rate: float = 3.0
-	force: float = 2.5
-	force_eps: float = 0.025
-	damping: float = 1.35
-	coupling: float = 0.5
+	lr: float 				 = 0.01
+	temperature: float    	 = 1.0
+	learning_rate: float  	 = 30.0
+	force: float          	 = 1.0
+	self_attention: float 	 = 2.0
+	eps: float     		  	 = 0.025
+	damping: float        	 = 1.15
+	coupling: float       	 = 0.55
 
 	seed: int = 42
 
@@ -227,29 +230,46 @@ def ode_vector_field(Z_s, Z_r, U, p_w, flags: Flags):
 	Returns flattened vector [f_s_flat; f_r_flat].
 	"""
 
-	decay_s = -flags.damping * Z_s
-	decay_r = -flags.damping * Z_r
+	u, temp, alpha, eps, gamma, kappa, eta = (
+		flags.force, 
+		flags.temperature, 
+		flags.self_attention, 
+		flags.eps, 
+		flags.damping, 
+		flags.learning_rate, 
+		flags.coupling
+	)
+	logits_s = Z_s
+	logits_r = Z_r
+	payoffs = U
 
-	# 2. Bizyaeva-style cross-inhibition commitment
-	# Within each row (state), messages compete
-	tanh_s = jnp.tanh(flags.force * Z_s + flags.force_eps)
-	tanh_r = jnp.tanh(flags.force * Z_r + flags.force_eps)
+	decay_s = -gamma * logits_s
+	decay_r = -gamma * logits_r
+	
+	tanh_s = jnp.tanh(alpha * logits_s + eps)
+	tanh_r = jnp.tanh(alpha * logits_r + eps)
 
-	n_w = Z_s.shape[0]
+	n_w = logits_s.shape[0]
 	p_w = jnp.ones(n_w) / n_w
 
+	# Phi-modulated Laplacian competition
+	phi_s = corrected_phi(logits_r, temp)
+	phi_r = corrected_phi(logits_r, temp)
+
+	L_s = calculate_laplacian_inhibition(logits_s) * phi_s
+	L_r = calculate_laplacian_inhibition(logits_r) * phi_r
+
 	# 3. REINFORCE-like Reward Drive
-	grads_s, grads_r = extrinsic_analytical_reward_grad(Z_s, Z_r, U, p_w, flags.temperature)
+	grads_s, grads_r = extrinsic_analytical_reward_grad(logits_s, logits_r, payoffs, p_w, temp)
 	# 4. Competitive Laplacian (Enforces Uniqueness)
 	dLogits_s = decay_s \
 				+ tanh_s \
-				+ flags.learning_rate * grads_s \
-				- flags.coupling * calculate_laplacian_inhibition(Z_s) 
+				+ kappa * grads_s + eta * L_s
 	
 	dLogits_r = decay_r \
 				+ tanh_r \
-				+ flags.learning_rate * grads_r \
-				- flags.coupling * calculate_laplacian_inhibition(Z_r) 
+				+ kappa * grads_r + eta * L_r
+	
 
 	return jnp.concatenate([dLogits_s.flatten(), dLogits_r.flatten()])
 
@@ -332,16 +352,16 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
      
 
 	logs = dict(
-		rewards = np.zeros((flags.num_runs, flags.num_iterations)),
-		loss = np.zeros((flags.num_runs, flags.num_iterations)),    
-		leading_eigenvalue = np.zeros((flags.num_runs, flags.num_iterations)),
-		coordination_success = np.zeros((flags.num_runs, flags.num_iterations)),
-		free_energy_dyn = np.zeros((flags.num_runs, flags.num_iterations)),
-		free_energy_mi = np.zeros((flags.num_runs, flags.num_iterations)),
-		social_entropy = np.zeros((flags.num_runs, flags.num_iterations)),
-		joint_mi = np.zeros((flags.num_runs, flags.num_iterations)),
-		cic = np.zeros((flags.num_runs, flags.num_iterations)),
-		expl = np.zeros((flags.num_runs, flags.num_iterations)),
+		rewards = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		loss = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),    
+		leading_eigenvalue = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		coordination_success = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		free_energy_dyn = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		free_energy_mi = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		social_entropy = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		joint_mi = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		cic = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
+		expl = np.zeros((flags.num_runs, flags.num_iterations//flags.log_every)),
 	)
 
 	sender_beliefs_= np.zeros((flags.num_runs, num_states, num_messages))
@@ -381,7 +401,7 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 				lambda x: get_policy_from_logits(x, flags.temperature), 
 				(sender_beliefs, receiver_beliefs)
 			)
-			
+
 			cur_idx = (i, ep)
 			expl, _ = calculate_exploitability(game, sender_policy, receiver_policy)  
 
@@ -405,11 +425,11 @@ def run_simulation(flags: Flags, beliefs: tuple = None):
 			logs["joint_mi"][cur_idx] = joint_mi 
 			logs["cic"][cur_idx] = calculate_cic(sender_policy, receiver_policy) 
 			logs["expl"][cur_idx] = expl 
-                  
+				
 			logs["coordination_success"][cur_idx] = compute_coordination_success_analytical(
 				sender_policy, receiver_policy, payoffs
 			) * 100
-                  
+				
 			logs["rewards"][cur_idx] = compute_expected_reward(
 				sender_policy, receiver_policy, p_w, payoffs
 			)

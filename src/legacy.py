@@ -19,6 +19,7 @@ from metrics import (
 	calculate_social_metrics, 
 	calculate_free_energy, 
 	calculate_cic,
+	corrected_laplacian_inhibition
 )
 
 import matplotlib.pyplot as plt
@@ -857,6 +858,41 @@ def run_simulation(flags: Flags, beliefs: tuple = None, return_logs: bool = True
 	# return_value = jax.tree.map(lambda x: x.mean(0), (sender_beliefs_, receiver_beliefs_)), logs
 
 	return (sender_beliefs_, receiver_beliefs_), logs
+
+
+def corrected_opinion_dynamics(t: chex.Array, x: chex.Array, args: tuple) -> chex.Array:
+	r""" 
+	\dot{z} = -\gamma z + \beta \tanh(z) + \kappa \nabla_{z} \mathbb{E}_{z}R - \eta \mathcal{L}z
+	"""
+	beta, temp, eps, gamma, kappa, eta, shape_s, shape_r, payoffs = args
+	
+	thr=shape_s[0]*shape_s[1]
+	logits_s = x[:thr].reshape(shape_s)
+	logits_r = x[thr:].reshape(shape_r)
+
+	decay_s = -gamma * logits_s
+	decay_r = -gamma * logits_r
+    
+	tanh_s = jnp.tanh(beta * logits_s + eps)
+	tanh_r = jnp.tanh(beta * logits_r + eps)
+	
+	n_w = logits_s.shape[0]
+	p_w = jnp.ones(n_w) / n_w
+
+	# 3. REINFORCE-like Reward Drive
+	grads_s, grads_r = extrinsic_analytical_reward_grad(logits_s, logits_r, payoffs, p_w, temp)
+	# 4. Competitive Laplacian (Enforces Uniqueness)
+	dLogits_s = decay_s \
+				+ tanh_s \
+				+ kappa * grads_s \
+				+ eta * corrected_laplacian_inhibition(logits_s)
+	 
+	dLogits_r = decay_r \
+				+ tanh_r \
+				+ kappa * grads_r \
+				+ eta * corrected_laplacian_inhibition(logits_r) 
+
+	return jnp.concatenate([dLogits_s.flatten(), dLogits_r.flatten()])
 
 		
 if __name__ == "__main__":

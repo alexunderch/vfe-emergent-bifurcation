@@ -27,8 +27,6 @@ def calculate_social_metrics(pi_s, pi_r):
     return p_wa, h_wa, h_w + h_a - h_wa
    
 
-
-
 def calculate_coordination_success(policy: chex.Array) -> float:
   
   # Success Metric: Trace of the policy (sum of diagonal)
@@ -167,6 +165,34 @@ def expected_utility(
 	return jnp.einsum("w,wm,ma,wa->", p_w, pi_s, pi_r, U)
 
 
+def corrected_phi(logits: chex.Array, temp: float = 1.0) -> chex.Array:
+    """
+    Competition modulator: active near origin, vanishes at permutation matrices.
+    
+    Uses normalized Simpson index (Gini heterogeneity) for each row and column.
+    
+    Properties:
+    - phi(0) = 1 (full competition at uniform state)
+    - phi(P) = 0 for any permutation matrix P (no competition at fixed point)
+    - 0 <= phi_ij <= 1 everywhere
+    """
+    sigma = jax.nn.softmax(logits * temp, axis=-1)
+    n_rows, n_cols = sigma.shape
+    
+    # Row heterogeneity: 0 at one-hot, (n-1)/n at uniform
+    row_gini = 1.0 - jnp.sum(sigma ** 2, axis=-1, keepdims=True)
+    # Normalize to [0,1]: divide by max possible value (n-1)/n
+    H_row = row_gini / ((n_cols - 1.0) / n_cols)
+    H_row = jnp.clip(H_row, 0.0, 1.0)
+    
+    # Column heterogeneity
+    col_gini = 1.0 - jnp.sum(sigma ** 2, axis=0, keepdims=True)
+    H_col = col_gini / ((n_rows - 1.0) / n_rows)
+    H_col = jnp.clip(H_col, 0.0, 1.0)
+    
+    # Competition active when BOTH row and column are undecided
+    return H_row * H_col
+
 def calculate_laplacian_inhibition(logits: chex.Array):
     """Constructs the bipartite competition term L*z."""
 
@@ -177,6 +203,18 @@ def calculate_laplacian_inhibition(logits: chex.Array):
     # Project out uniform (gauge) mode: subtract mean
     Lz = Lz - jnp.mean(Lz)
     return Lz
+
+def make_laplacian(logits: chex.Array):
+    """Laplacian for an n_row x n_col matrix.
+    L = L_row + L_col  where each is a complete-graph clique."""
+    n_row, n_col = logits.shape
+    I_r, I_c = jnp.eye(n_row), jnp.eye(n_col)
+    J_r, J_c = jnp.ones((n_row, n_row)), jnp.ones((n_col, n_col))
+    # row clique: within each row, all entries connected
+    L_row = jnp.kron(I_r, n_col * I_c - J_c)
+    # column clique: within each col, all entries connected
+    L_col = jnp.kron(n_row * I_r - J_r, I_c)
+    return (L_row + L_col)
 
 
 def corrected_laplacian_inhibition(logits: chex.Array) -> chex.Array:
@@ -204,31 +242,102 @@ def corrected_laplacian_inhibition(logits: chex.Array) -> chex.Array:
     
     return L_row + L_col
 
+def balanced_laplacian_inhibition(logits: chex.Array):
+    n_rows, n_cols = logits.shape
+    row_mean = jnp.mean(logits, axis=1, keepdims=True)
+    col_mean = jnp.mean(logits, axis=0, keepdims=True)
+    return (logits - row_mean) / n_cols + (logits - col_mean) / n_rows
+
+def make_laplacian2(logits: chex.Array) -> chex.Array:
+    """
+    Bizyaeva-style Laplacian for opinion dynamics with competition.
+    L Z = (J-I)Z + Z(J-I) = JZ + ZJ - 2Z
+    
+    This is NOT the standard graph Laplacian. It has negative eigenvalues
+    for competitive modes, essential for enforcing one-to-one mappings.
+    
+    Spectrum for n×n: {2(n-1), n-2, -2} with multiplicities.
+    """
+    n_row, n_col = logits.shape
+    
+    # JZ: row sums broadcast across columns
+    row_sums = jnp.sum(logits, axis=1, keepdims=True)
+    JZ = jnp.broadcast_to(row_sums, logits.shape)
+    
+    # ZJ: column sums broadcast across rows
+    col_sums = jnp.sum(logits, axis=0, keepdims=True)
+    ZJ = jnp.broadcast_to(col_sums, logits.shape)
+    
+    # Bizyaeva Laplacian
+    return JZ + ZJ - 2 * logits
 
 def dynamical_vfe(Z_s: chex.Array, Z_r: chex.Array, U, p_w: chex.Array, flags):
     """
-    F(Z) = γ/2 ||Z||² - Σ 1/β ln(cosh(βZ+ε)) + η/2 Z^T L Z - κ E[U]
+    F(Z) = γ/2 ||Z||² - Σ 1/β ln(cosh(βZ+ε)) - η/2 Z^T L Z - κ E[U]
     """
 
     # 1. Dissipation (complexity)
     diss = 0.5 * flags.damping * (jnp.sum(Z_s**2) + jnp.sum(Z_r**2))
     
-
     # 2. Commitment (symmetry-breaking)
-    commit = -(1.0 / flags.force) * (
-        jnp.sum(jnp.log(jnp.cosh(flags.force * Z_s + flags.force_eps))) +
-        jnp.sum(jnp.log(jnp.cosh(flags.force * Z_r + flags.force_eps)))
-    ) if flags.force > 0 else 0.0
+    commit = -(flags.force / flags.self_attention) * (
+        jnp.sum(
+            jnp.log(
+                jnp.cosh(
+                    flags.self_attention * Z_s 
+                    + flags.eps
+                )
+            )
+        ) +
+        jnp.sum(
+            jnp.log(
+                jnp.cosh(
+                    flags.self_attention * Z_r
+                    + flags.eps 
+                )
+            )
+        )
+    ) if flags.self_attention > 0 else 0.0
+
+    phi_s = corrected_phi(Z_s, flags.temperature)
+    phi_r = corrected_phi(Z_r, flags.temperature)
+
+    L_s = calculate_laplacian_inhibition(Z_s) 
+    L_r = calculate_laplacian_inhibition(Z_r) 
     
     # 3. Laplacian competition
-    lap_s = -0.5 * flags.coupling * jnp.sum(Z_s * corrected_laplacian_inhibition(Z_s))
-    lap_r = -0.5 * flags.coupling * jnp.sum(Z_r * corrected_laplacian_inhibition(Z_r))
+    lap_s = -0.5 * flags.coupling * jnp.sum(Z_s * L_s * phi_s)
+    lap_r = -0.5 * flags.coupling * jnp.sum(Z_r * L_r * phi_r)
     
     # 4. Expected utility (accuracy, negative because F = Complexity - Accuracy)
-    acc = -flags.learning_rate * expected_utility(Z_s, Z_r, U, p_w, flags.temperature)
+    acc = -2 * flags.learning_rate * expected_utility(Z_s, Z_r, U, p_w, flags.temperature)
     
-    total = diss + commit + lap_s + lap_r + acc
+    total = diss + commit + acc + lap_s + lap_r
     return total
+def nonlinear_inhibition(logits: chex.Array, temp: float = 1.0) -> chex.Array:
+    """
+    Nonlinear competition that:
+      - is 0 at uniform logits (preserves the pitchfork bifurcation point)
+      - is 0 at one-hot rows/columns (preserves permutation fixed points)
+      - amplifies differences during the transient
+    """
+    pi = jax.nn.softmax(logits * temp, axis=-1)
+
+    # Row spread: 0 at one-hot, (1 - 1/n) at uniform
+    row_spread = 1.0 - jnp.sum(pi ** 2, axis=-1, keepdims=True)
+
+    # Column spread (measure how "peaked" each column is)
+    col_sums = jnp.sum(pi, axis=0, keepdims=True)
+    pi_col_norm = pi / (col_sums + 1e-10)
+    col_spread = 1.0 - jnp.sum(pi_col_norm ** 2, axis=0, keepdims=True)
+
+    # Centered logits
+    row_mean = jnp.mean(logits, axis=-1, keepdims=True)
+    col_mean = jnp.mean(logits, axis=0, keepdims=True)
+
+    # Anti-diffusion: pushes entries away from their row/column means
+    # Strength is proportional to how far the row/column is from one-hot
+    return row_spread * (logits - row_mean) + col_spread * (logits - col_mean)
 
 @jax.jit
 def calculate_cic(speaker_probs, listener_probs):

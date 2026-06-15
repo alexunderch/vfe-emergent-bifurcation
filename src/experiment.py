@@ -428,6 +428,7 @@ def evaluate_policies(
 		force_eps = r"$\epsilon$",
 		damping = r"$\gamma$",
 		coupling = r"$\eta$",
+		self_attention = r"$\alpha$",
 	)
 
 	plot_scalars(
@@ -582,15 +583,15 @@ def plot_coordination_snap(
 	mean1 = scalar.mean(axis=0)
 	sem1 = stats.sem(scalar, axis=0)
 	ln3 = ax2.plot(params, mean1, color=color, label=r"Cons. lead. eigenval. of Z=$(Z^s, Z^r)$")
-	ln4 = ax2.axvline(0.85, color="black", linestyle='-.', alpha=0.5, label=r"$\mu=\beta_c-\gamma+\eta=0$") #
+	ln4 = ax2.axvline(flags.damping-flags.coupling, color="black", linestyle='-.', alpha=0.5, label=r"$\beta_c=\gamma-\eta$") #
 	ln5 = ax2.axhline(0, color='black', linestyle='--', alpha=0.5, label=r"Re$(\lambda_{\max})=0$") # The Zero Crossing
-	ln6 = ax2.axhline(-0.85, color='black', linestyle='--', alpha=0.5, label=r"Cons. Re$(\lambda_{\max})=\gamma-\eta$") # The Zero Crossing
+	ln6 = ax2.axhline(-flags.damping, color='black', linestyle='--', alpha=0.5, label=r"Cons. Re$(\lambda_{\max})=\gamma-\eta$") # The Zero Crossing
 	ax2.fill_between(params, mean1 - sem1, mean1 + sem1, alpha=0.5, color=color)
 	ax2.set_ylabel(r"Re$(\lambda_{\max})$", color=color)
 	ax2.tick_params(axis='y', labelcolor=color)
 	
-	lns = ln1+[ln2]+ln3+[ln4]+[ln5]+[ln6]
 	# lns = ln1+ln3+[ln4]+[ln5]
+	lns = ln1+[ln2]+ln3+[ln4, ln5, ln6]
 	labs = [l.get_label() for l in lns]
 	ax1.legend(lns, labs, loc=0)
 
@@ -605,36 +606,43 @@ def plot_coordination_snap(
 if __name__ == "__main__":
 
 	parameter_config_beta = {
-		"name": "force",
-		"min": 0.35,
+		"name": "self_attention",
+		"min": 0.15,
 		"max": 5.0,
 		"num_points": 0.5
 	}
 
 	plot_coordination_snap(
-		SFlags(payoffs="classic", end_time=1.0, num_iterations=1, force_eps=0.0), #approx. analytic Jacobian
+		SFlags(payoffs="classic", end_time=0.5, num_iterations=1, eps=0.0), #approx. analytic Jacobian
 		simple_simulation, 
 		parameter_config_beta,
 		origin=True
-	)
+	) 
+
+	parameter_config_beta = {
+		"name": "self_attention",
+		"min": 0.1,
+		"max": 7.0,
+		"num_points": 1.0
+	}
 
 	plot_coordination_snap(
-		SFlags(payoffs="classic", end_time=100.0, num_iterations=1, force_eps=0.0), 
+		SFlags(payoffs="classic", end_time=100.0, num_iterations=1, eps=0.0), 
 		simple_simulation, 
 		parameter_config_beta
 	)
 	
 	parameter_config_beta = {
-		"name": "force",
-		"min": 1.0,
-		"max": 5.0,
+		"name": "self_attention",
+		"min": 0.05,
+		"max": 7.0,
 		"num_points": 4
 	}
 
 	parameter_config_gamma = {
 		"name": "damping",
 		"min": 0.0,
-		"max": 4.5,
+		"max": 2.5,
 		"num_points": 4
 	}
 
@@ -648,7 +656,7 @@ if __name__ == "__main__":
 	parameter_config_kappa = {
 		"name": "learning_rate",
 		"min": 0.0,
-		"max": 4.5,
+		"max": 30.5,
 		"num_points": 4
 	}
 	
@@ -659,41 +667,30 @@ if __name__ == "__main__":
 			num_iterations=1, 
 		), 
 		simple_simulation,
-		# parameter_config=parameter_config_beta
+		parameter_config=parameter_config_kappa
 	)
 
 	evaluate_policies(
 		NFlags(
 			payoffs="classic", 
-			num_iterations=10000, 
+			num_iterations=100, 
 		), 
 		neural_simulation,
 		parameter_config=parameter_config_beta
 	)
 
 
-
-	evaluate_policies(
-		SFlags(
-			payoffs="classic", 
-			end_time=100.0, 
-			num_iterations=1, 
-		), 
-		simple_simulation,
-		parameter_config=parameter_config_kappa
-	)
-
 	parameter_config_beta = {
 		"name": "force",
 		"min": 0.0,
 		"max": 6.5,
-		"num_points": 10
+		"num_points": 100
 	}
 	parameter_config_gamma = {
 		"name": "damping",
 		"min": 0.0,
 		"max": 6.5,
-		"num_points": 10
+		"num_points": 100
 	}
 
 	two_parameter_sweep(SFlags(
@@ -710,8 +707,8 @@ if __name__ == "__main__":
 		parameter_config=parameter_config_beta
 	)
 
-	_, ode_logs = simple_simulation(SFlags(payoffs="classic", end_time=10.0, num_iterations=1))
-	_, neural_logs = neural_simulation(NFlags(payoffs="classic", num_iterations=int(1e2), lr=1e-2))
+	_, ode_logs = simple_simulation(SFlags(payoffs="classic", end_time=100.0, num_iterations=1))
+	_, neural_logs = neural_simulation(NFlags(payoffs="classic", num_iterations=int(1e4), lr=1e-2))
 	plot_comparison(ode_logs, neural_logs, "./fig_neural_vfe.pdf")
 
 	# Correlation analysis
