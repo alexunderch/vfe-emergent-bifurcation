@@ -1,5 +1,6 @@
 import enum
 from typing import Callable
+import json
 
 import jax
 import matplotlib as mpl
@@ -95,9 +96,7 @@ def one_parameter_sweep(
 	ax.set_ylabel("Mutual Information (bits)")
 	ax.grid(True, alpha=0.3)
 
-	plt.savefig(f'onep_sweep_{param_name}_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
-	plt.tight_layout()
-	plt.show()
+	plt.savefig(f'./results/fig_sweep_{param_name}_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
 
 def two_parameter_sweep(
 	flags:  SFlags, 
@@ -141,8 +140,8 @@ def two_parameter_sweep(
 	plt.ylabel(r'Damping rate $\gamma$')
 	plt.title('Phase Diagram: Classic Lewis game')
 
-	plt.show()
-	plt.tight_layout()
+	plt.savefig(f'./results/fig_sweep_{flags.payoffs}_eta-gamma.pdf', format = 'pdf', bbox_inches='tight')
+
 
 
 def plot_comparison(ode_logs, neural_logs, save_path):
@@ -243,8 +242,8 @@ def plot_comparison(ode_logs, neural_logs, save_path):
 		ax.grid(True, alpha=0.3)
 
 	plt.tight_layout()
-	plt.savefig(save_path, dpi=300, bbox_inches='tight')
-	plt.show()
+	plt.savefig("f./results/{save_path}", format = 'pdf', bbox_inches='tight')
+
 
 	return fig
 
@@ -303,8 +302,7 @@ def hysteresis(
 	plt.ylabel(r"Mutual Information $I(\mathcal{W}, \mathcal{A})$ (bits)")
 	plt.legend()
 	plt.grid(True)
-	plt.savefig(f'hysteresis_{param_name}_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
-	plt.show()
+	plt.savefig(f'./results/fig_hysteresis_{param_name}_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
 
 
 def evaluate_policies(
@@ -377,6 +375,8 @@ def evaluate_policies(
 
 		if scalar_labels is not None:
 			plot_axis.legend()
+		plt.savefig(f'./results/fig_{ax_labels[1]}_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
+		
 
 	def plot_confusion_matrix(cm, cmap=plt.cm.Blues, title=None):
 		"""Plot the confusion matrix.
@@ -420,6 +420,8 @@ def evaluate_policies(
 			_, log = sim(flags)
 		else:
 			_, log = sim(flags._replace(**{param_name: p}))
+		with open (f"./results/traj_{flags.payoffs}_{param_name}_{p}.json", "w") as f:
+			json.dump(log, f)
 		logs.append(log)
 
 	param_names = dict(
@@ -444,20 +446,7 @@ def evaluate_policies(
 		scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
 		ax_labels=["Episodes", "Reward per episode"],
 	)
-	# plot_scalars(
-	# 	[l["opts" + ("_r" if role == Role.RECEIVER else "_s")] for l in logs],
-	# 	title="Percentage of optimal actions",
-	# 	scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
-	# 	ax_labels=["Episodes", "% optimal actions"],
-	# )
-
-	# plot_scalars(
-	# 	[l["coordination_success" + ("_r" if role == Role.RECEIVER else "_s")] for l in logs],
-	# 	title="Coordination success of the system",
-	# 	scalar_labels=None if parameter_config is None else [f"{param_names[param_name]}={p:.1f}" for p in params],
-	# 	ax_labels=["Episodes", "% optimal actions"],
-	# )
-
+	
 	plot_scalars(
 		[l["coordination_success"] for l in logs],
 		title="Coordination success of the system",
@@ -508,9 +497,6 @@ def evaluate_policies(
 		ax_labels=["Episodes", "NashConv"],
 	)
 
-	# plot_confusion_matrix(
-	# 	logs[0]["convergence_point"].astype(int), title="Final policy"
-	# )
 	
 	if parameter_config is not None:
 		print_data = []
@@ -531,9 +517,10 @@ def evaluate_policies(
 				r"Coord. Success": f"{log["coordination_success"][:, -1].mean(0):.2f}±{stats.sem(log["coordination_success"][:, -1], axis=0):.2f}",
 				"Emergence time": f"{zc.mean():.2f}±{stats.sem(zc, axis=0) if zc.mean() != np.inf else np.inf:.2f}"
 			})
-		print(pd.DataFrame(print_data))
+		df = pd.DataFrame(print_data)
+		print(df)
+		df.to_csv(f'./results/metrics_{flags.payoffs}.csv', index=False)
 
-	plt.show()
 
 def plot_coordination_snap(	
 	flags:  SFlags, 
@@ -597,11 +584,7 @@ def plot_coordination_snap(
 
 	plt.grid(axis="both")
 	plt.title('The Coordination Snap: Bifurcation vs. Information')
-
-	plt.savefig(f'snap_{flags.payoffs}.pdf', format = 'pdf', bbox_inches='tight')
-
-	fig.tight_layout()
-	plt.show()
+	plt.savefig(f'./results/fig_bifurcation_{flags.payoffs}_{'at_origin' if origin else ''}.pdf', format = 'pdf', bbox_inches='tight')
 
 if __name__ == "__main__":
 
